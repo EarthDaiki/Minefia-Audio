@@ -39,3 +39,10 @@ screencapturekit = "11"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 wasapi = "0.26"
+
+[profile.dev]
+debug = 1
+incremental = true
+
+[profile.dev.package."*"]
+debug = false
