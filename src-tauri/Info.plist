@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>Minefia Audio records system audio so it can create a live transcript.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Minefia Audio records your selected microphone after you press Start to create a transcript.</string>
+</dict>
+</plist>
