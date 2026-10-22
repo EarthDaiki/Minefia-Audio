@@ -12,7 +12,7 @@ export type AudioInfo = {
   contextPrompt?: string | null;
 };
 
-export type SavedTranscript = { id: string; name: string; date: string; text: string; kind: "transcript" | "enhanced" | "summary" | "translation" | "summary_translation"; path: string };
+export type SavedTranscript = { id: string; name: string; date: string; text: string; kind: "transcript" | "enhanced" | "summary" | "notes" | "translation" | "summary_translation"; path: string };
 export type LibraryFile = { path: string; name: string; date: string; sizeBytes: number; isReference: boolean; contextPrompt?: string | null };
 
 export type AudioTrackInfo = {
@@ -26,6 +26,8 @@ export type AudioTrackInfo = {
 };
 
 export type TranscriptionEvent = {
+  taskId: string;
+  taskSlot: "file" | "online" | "system";
   kind: "preparing" | "uploading" | "retrying" | "prompt" | "delta" | "chunk_done" | "done" | "error";
   message?: string;
   delta?: string;
@@ -49,8 +51,10 @@ export type SummaryEvent = {
   delta?: string;
 };
 
+export type ProjectCosts = { projectId: string; days: { date: string; models: { model: string; amountUsd: number }[]; totalUsd: number }[]; totalUsd: number; currency: string };
+
 export type SystemAudioEvent = {
-  kind: "status" | "queue" | "warning" | "transcript" | "error" | "done";
+  kind: "status" | "queue" | "warning" | "transcript" | "capture_stopped" | "error" | "done";
   elapsedSeconds: number;
   chunkSeconds: number;
   completedChunks: number;
@@ -133,6 +137,9 @@ export type TranscribeRequest = {
   model: string;
   parallelRequests: number;
   jobId: string;
+  taskId: string;
+  taskSlot: "file" | "online";
+  taskComplete: boolean;
   contextPrompt?: string | null;
 };
 
@@ -149,7 +156,13 @@ export type ApiKeySummary = {
   label: string;
   masked: string;
   isSelected: boolean;
+  openaiKeyId?: string | null;
 };
+
+export type AdminApiKeySummary = ApiKeySummary;
+export type OpenAIProjectSummary = { id: string; name: string; status: string };
+export type MinefiaProject = { projectId: string | null; projectName: string | null; createdByApp: boolean; serviceAccountId: string | null; serviceAccountName: string | null; apiKeyId: string | null };
+export type CreatedProjectKey = { project: MinefiaProject; key: ApiKeySummary };
 
 export type TranscriptionModel = {
   id: "gpt-transcribe" | "gpt-4o-transcribe" | "gpt-4o-mini-transcribe" | "gpt-4o-transcribe-diarize";

@@ -34,13 +34,15 @@ import { LibraryModal } from "./components/LibraryModal";
 import { DownloadModal } from "./components/DownloadModal";
 import { ApiAccessGate } from "./components/ApiAccessGate";
 import { ConfirmationModal } from "./components/ConfirmationModal";
+import { UsageModal } from "./components/UsageModal";
 import { formatBytes, formatDuration } from "./lib/format";
 import { TRANSLATION_LANGUAGES } from "./lib/languages";
 import { TRANSCRIPTION_MODELS, TRANSLATION_MODELS } from "./lib/models";
 import { estimatePartCount, estimateTranscriptionCost, estimateTranslationCost, formatUsd } from "./lib/pricing";
 import { splitReadableSections } from "./lib/textSections";
 import { errorMessage } from "./lib/errors";
-import type { ApiKeySummary, AudioInfo, AvailableModels, InputDevice, LibraryFile, OnlineMediaInfo, PageMediaInfo, RealtimeAudioEvent, ResumableJob, SavedTranscript, SummaryEvent, SystemAudioEvent, TranscriptVersion, TranscriptionEvent, TranscribeRequest, TranslationEvent } from "./types";
+import { rememberOpenAIKeyId } from "./lib/keyMetadata";
+import type { AdminApiKeySummary, ApiKeySummary, AudioInfo, AvailableModels, InputDevice, LibraryFile, MinefiaProject, OnlineMediaInfo, PageMediaInfo, ProjectCosts, RealtimeAudioEvent, ResumableJob, SavedTranscript, SummaryEvent, SystemAudioEvent, TranscriptVersion, TranscriptionEvent, TranscribeRequest, TranslationEvent } from "./types";
 
 const MAX_BYTES = 20_000_000;
 const TARGET_PART_SECONDS = 5 * 60;
@@ -141,6 +143,9 @@ export default function App() {
   const [originalTranscript, setOriginalTranscript] = useState("");
   const [enhancedTranscript, setEnhancedTranscript] = useState("");
   const [summaryMode, setSummaryMode] = useState(false);
+  const [notesMode, setNotesMode] = useState(false);
+  const [notesText, setNotesText] = useState("");
+  const [summaryTranslationLive, setSummaryTranslationLive] = useState(false);
   const [summaryText, setSummaryText] = useState("");
   const [summaryDraft, setSummaryDraft] = useState("");
   const [summaryGenerating, setSummaryGenerating] = useState(false);
@@ -187,12 +192,18 @@ export default function App() {
     return TRANSCRIPTION_MODELS.some((item) => item.id === stored) ? stored! : "gpt-transcribe";
   });
   const [apiKeys, setApiKeys] = useState<ApiKeySummary[]>([]);
+  const [adminApiKeys, setAdminApiKeys] = useState<AdminApiKeySummary[]>([]);
+  const [projectUsageReady, setProjectUsageReady] = useState(false);
   const [availableModelIds, setAvailableModelIds] = useState<string[]>([]);
   const [availableTranslationModelIds, setAvailableTranslationModelIds] = useState<string[]>([]);
   const [modelsLoading, setModelsLoading] = useState(true);
   const [modelLoadError, setModelLoadError] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [libraryOpen, setLibraryOpen] = useState(false);
+  const [usageOpen, setUsageOpen] = useState(false);
+  const [projectCosts, setProjectCosts] = useState<ProjectCosts | null>(null);
+  const [usageLoading, setUsageLoading] = useState(false);
+  const [usageError, setUsageError] = useState("");
   const [localImporting, setLocalImporting] = useState(false);
   const [downloadOpen, setDownloadOpen] = useState(false);
   const [conversionOpen, setConversionOpen] = useState(false);
@@ -209,8 +220,10 @@ export default function App() {
   const [onlineCancelRequested, setOnlineCancelRequested] = useState(false);
   const [onlineKeepVideo, setOnlineKeepVideo] = useState(false);
   const [downloadLanguage, setDownloadLanguage] = useState("Original");
-  const [busy, setBusy] = useState(false);
-  const [transcriptionCancelRequested, setTranscriptionCancelRequested] = useState(false);
+  const [transcriptionBusyBySlot, setTranscriptionBusyBySlot] = useState<Record<"file" | "online", boolean>>({ file: false, online: false });
+  const [transcriptionCancelBySlot, setTranscriptionCancelBySlot] = useState<Record<"file" | "online", boolean>>({ file: false, online: false });
+  const busy = sourceMode !== "system" && transcriptionBusyBySlot[sourceMode];
+  const transcriptionCancelRequested = sourceMode !== "system" && transcriptionCancelBySlot[sourceMode];
   const [completed, setCompleted] = useState(false);
   const [phase, setPhase] = useState("Choose an audio file to begin");
   const [progress, setProgress] = useState(0);
@@ -235,11 +248,23 @@ export default function App() {
   const [availableRealtimeModelIds, setAvailableRealtimeModelIds] = useState<string[]>([]);
   const transcriptParts = useRef<Record<number, string>>({});
   const completedParts = useRef<Set<number>>(new Set());
+  const transcriptionTasks = useRef<Partial<Record<"file" | "online", {
+    id: string; sessionId: string; sessionName: string; chunkOffset: number; totalChunks: number; fileIndex: number; fileCount: number; active: boolean;
+    parts: Record<number, string>; complete: Set<number>; attempts: Record<number, number>; persistence: Promise<void>; phase: string; progress: number; error: string;
+  }>>>({});
   const translatingLanguage = useRef("");
   const transcriptRef = useRef("");
+  const sourceModeRef = useRef(sourceMode);
+  const completedRef = useRef(completed);
   const summaryTextRef = useRef("");
   const summaryModeRef = useRef(false);
+  const notesModeRef = useRef(false);
+  const summaryTranslationLiveRef = useRef(false);
+  const notesTextRef = useRef("");
   const summaryModelRef = useRef(translationModel);
+  const summaryTranslationModelRef = useRef(summaryTranslationModel);
+  const targetLanguageRef = useRef(targetLanguage);
+  const customLanguageRef = useRef(customLanguage);
   const summaryQueue = useRef<Promise<void>>(Promise.resolve());
   const liveFinalTranscript = useRef("");
   const livePersistedTranscript = useRef("");
@@ -255,23 +280,25 @@ export default function App() {
   const transcriptTabs = useRef<Record<"file" | "online" | "system", {
     transcript: string; originalTranscript: string; enhancedTranscript: string; summaryText: string; translations: Record<string, string>;
     summaryTranslations: Record<string, string>; questionMessages: { role: "user" | "assistant"; text: string }[];
+    notesText: string; notesMode: boolean; summaryTranslationLive: boolean;
     activeLanguage: string; completed: boolean; summaryMode: boolean; translationEnabled: boolean;
     sessionId: string; sessionName: string;
   }>>({
-    file: { transcript: "", originalTranscript: "", enhancedTranscript: "", summaryText: "", translations: {}, summaryTranslations: {}, questionMessages: [], activeLanguage: "Original", completed: false, summaryMode: false, translationEnabled: false, sessionId: "", sessionName: "Transcript" },
-    online: { transcript: "", originalTranscript: "", enhancedTranscript: "", summaryText: "", translations: {}, summaryTranslations: {}, questionMessages: [], activeLanguage: "Original", completed: false, summaryMode: false, translationEnabled: false, sessionId: "", sessionName: "Transcript" },
-    system: { transcript: "", originalTranscript: "", enhancedTranscript: "", summaryText: "", translations: {}, summaryTranslations: {}, questionMessages: [], activeLanguage: "Original", completed: false, summaryMode: false, translationEnabled: false, sessionId: "", sessionName: "Transcript" },
+    file: { transcript: "", originalTranscript: "", enhancedTranscript: "", summaryText: "", notesText: "", notesMode: false, summaryTranslationLive: false, translations: {}, summaryTranslations: {}, questionMessages: [], activeLanguage: "Original", completed: false, summaryMode: false, translationEnabled: false, sessionId: "", sessionName: "Transcript" },
+    online: { transcript: "", originalTranscript: "", enhancedTranscript: "", summaryText: "", notesText: "", notesMode: false, summaryTranslationLive: false, translations: {}, summaryTranslations: {}, questionMessages: [], activeLanguage: "Original", completed: false, summaryMode: false, translationEnabled: false, sessionId: "", sessionName: "Transcript" },
+    system: { transcript: "", originalTranscript: "", enhancedTranscript: "", summaryText: "", notesText: "", notesMode: false, summaryTranslationLive: false, translations: {}, summaryTranslations: {}, questionMessages: [], activeLanguage: "Original", completed: false, summaryMode: false, translationEnabled: false, sessionId: "", sessionName: "Transcript" },
   });
 
   function switchSourceMode(next: "file" | "online" | "system") {
     if (next === sourceMode) return;
     transcriptTabs.current[sourceMode] = {
-      transcript, originalTranscript, enhancedTranscript, summaryText, translations, summaryTranslations, questionMessages, activeLanguage, completed, summaryMode, translationEnabled,
+      transcript, originalTranscript, enhancedTranscript, summaryText, notesText, notesMode, summaryTranslationLive, translations, summaryTranslations, questionMessages, activeLanguage, completed, summaryMode, translationEnabled,
       sessionId: transcriptSessionId.current, sessionName: transcriptSessionName.current,
     };
     const saved = transcriptTabs.current[next];
     transcriptRef.current = saved.transcript;
     summaryTextRef.current = saved.summaryText;
+    notesTextRef.current = saved.notesText;
     summaryModeRef.current = saved.summaryMode;
     transcriptSessionId.current = saved.sessionId;
     transcriptSessionName.current = saved.sessionName;
@@ -279,6 +306,11 @@ export default function App() {
     setOriginalTranscript(saved.originalTranscript);
     setEnhancedTranscript(saved.enhancedTranscript);
     setSummaryText(saved.summaryText);
+    setNotesText(saved.notesText);
+    setNotesMode(saved.notesMode);
+    notesModeRef.current = saved.notesMode;
+    setSummaryTranslationLive(saved.summaryTranslationLive);
+    summaryTranslationLiveRef.current = saved.summaryTranslationLive;
     setTranslations(saved.translations);
     setSummaryTranslations(saved.summaryTranslations);
     setQuestionMessages(saved.questionMessages);
@@ -287,6 +319,10 @@ export default function App() {
     setSummaryMode(saved.summaryMode);
     setTranslationEnabled(saved.translationEnabled);
     setSourceMode(next);
+    if (next !== "system") {
+      const task = transcriptionTasks.current[next];
+      if (task) { setPhase(task.phase); setProgress(task.progress); setError(task.error); }
+    }
   }
 
   function startTranscriptSession(name: string) {
@@ -363,6 +399,41 @@ export default function App() {
     catch (cause) { setError(errorMessage(cause)); }
   }
 
+  async function refreshUsage() {
+    setUsageLoading(true);
+    setUsageError("");
+    try { setProjectCosts(await invoke<ProjectCosts>("fetch_project_costs")); }
+    catch (cause) { setUsageError(errorMessage(cause)); }
+    finally { setUsageLoading(false); }
+  }
+
+  async function refreshAdminApiKeys() {
+    try { setAdminApiKeys(await invoke<AdminApiKeySummary[]>("list_admin_api_keys")); }
+    catch { setAdminApiKeys([]); }
+  }
+
+  async function refreshProjectUsage() {
+    try {
+      const project = await invoke<MinefiaProject>("get_minefia_project");
+      const ready = await invoke<boolean>("minefia_usage_ready");
+      rememberOpenAIKeyId(ready ? project.apiKeyId : null);
+      setProjectUsageReady(ready);
+      if (!ready) setUsageOpen(false);
+    } catch {
+      rememberOpenAIKeyId(null);
+      setProjectUsageReady(false);
+      setUsageOpen(false);
+    }
+  }
+
+  async function refreshSettingsKeys() {
+    await Promise.all([refreshApiKeys(), refreshAdminApiKeys(), refreshProjectUsage()]);
+  }
+
+  function isLocalTaskBusy() {
+    return localImporting || transcriptionBusyBySlot.file || (sourceMode === "file" && (summaryGenerating || summaryTranslating || translating || questionBusy || enhancementRunning));
+  }
+
   function recordTechnicalLog(category: string, message: string) {
     const signature = `${category}\n${message}`;
     const nowMs = Date.now();
@@ -394,7 +465,9 @@ export default function App() {
   }
 
   function openSavedTranscript(item: SavedTranscript) {
+    switchSourceMode("file");
     const isSummary = item.kind === "summary";
+    const isNotes = item.kind === "notes";
     const isSummaryTranslation = item.kind === "summary_translation";
     const isTranslation = item.kind === "translation";
     const isEnhanced = item.kind === "enhanced";
@@ -402,14 +475,16 @@ export default function App() {
     const hasSessionId = /^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(itemSessionId);
     transcriptSessionId.current = hasSessionId ? itemSessionId : item.kind === "transcript" ? item.id : "";
     const sessionItems = transcriptSessionId.current
-      ? savedTranscripts.filter((saved) => saved.id === transcriptSessionId.current || saved.id.startsWith(`enhanced:${transcriptSessionId.current}`) || saved.id.startsWith(`summary:${transcriptSessionId.current}`) || saved.id.startsWith(`translation:${transcriptSessionId.current}:`) || saved.id.startsWith(`summary-translation:${transcriptSessionId.current}:`))
+      ? savedTranscripts.filter((saved) => saved.id === transcriptSessionId.current || saved.id.startsWith(`enhanced:${transcriptSessionId.current}`) || saved.id.startsWith(`summary:${transcriptSessionId.current}`) || saved.id.startsWith(`notes:${transcriptSessionId.current}`) || saved.id.startsWith(`translation:${transcriptSessionId.current}:`) || saved.id.startsWith(`summary-translation:${transcriptSessionId.current}:`))
       : [item];
     const originalItem = sessionItems.find((saved) => saved.kind === "transcript");
     const enhancedItem = sessionItems.find((saved) => saved.kind === "enhanced");
     const summaryItem = sessionItems.find((saved) => saved.kind === "summary");
+    const notesItem = sessionItems.find((saved) => saved.kind === "notes");
     const originalText = originalItem?.text ?? (item.kind === "transcript" ? item.text : "");
     const enhancedText = enhancedItem?.text ?? (isEnhanced ? item.text : "");
     const summaryTextForSession = summaryItem?.text ?? (isSummary ? item.text : isSummaryTranslation ? "" : "");
+    const notesTextForSession = notesItem?.text ?? (isNotes ? item.text : "");
     const transcriptTranslationItems = sessionItems.filter((saved) => saved.kind === "translation");
     const savedTranscriptTranslations = Object.fromEntries(transcriptTranslationItems.map((saved) => [saved.name.split(" → ").at(-1) ?? "Translation", saved.text]));
     const savedSummaryTranslationItems = sessionItems.filter((saved) => saved.kind === "summary_translation");
@@ -433,6 +508,10 @@ export default function App() {
     summaryModeRef.current = showingSummary;
     setSummaryText(summaryTextForSession);
     summaryTextRef.current = summaryTextForSession;
+    setNotesText(notesTextForSession);
+    notesTextRef.current = notesTextForSession;
+    setNotesMode(false);
+    notesModeRef.current = false;
     setSummaryStatus(showingSummary ? "ended" : "idle");
     setSummaryTranslations(isSummaryTranslation && !Object.keys(savedSummaryTranslations).length ? { [`${savedTranslationLanguage} · ${selectedSummaryTranslationModel?.name ?? "gpt-6-luna"}`]: item.text } : savedSummaryTranslations);
     if (selectedTranslationLanguage) setTargetLanguage(selectedTranslationLanguage);
@@ -444,12 +523,16 @@ export default function App() {
       translations: savedTranscriptTranslations,
       summaryTranslations: savedSummaryTranslations,
       questionMessages: [],
-      activeLanguage: isEnhanced ? "Enhanced" : isTranslation ? selectedTranslationLanguage ?? "Original" : "Original", completed: true, summaryMode: showingSummary, translationEnabled: false,
+      activeLanguage: isEnhanced ? "Enhanced" : isTranslation ? selectedTranslationLanguage ?? "Original" : "Original", completed: true, summaryMode: showingSummary, notesText: notesTextForSession, notesMode: false, summaryTranslationLive: false, translationEnabled: false,
       sessionId: transcriptSessionId.current, sessionName: transcriptSessionName.current,
     };
   }
 
   async function importLocalFile(path: string, append = false) {
+    if (transcriptionBusyBySlot.file) {
+      setError("Local file is busy with a transcription. Wait for it to finish before importing another file.");
+      return;
+    }
     startTechnicalTask("Local media import");
     setLocalImporting(true);
     setProgress(4);
@@ -493,11 +576,41 @@ export default function App() {
   }
 
   useEffect(() => { summaryModeRef.current = summaryMode; }, [summaryMode]);
+  useEffect(() => { sourceModeRef.current = sourceMode; }, [sourceMode]);
+  useEffect(() => { completedRef.current = completed; }, [completed]);
+  useEffect(() => { notesModeRef.current = notesMode; }, [notesMode]);
+  useEffect(() => { summaryTranslationLiveRef.current = summaryTranslationLive; }, [summaryTranslationLive]);
   useEffect(() => { summaryModelRef.current = translationModel; }, [translationModel]);
+  useEffect(() => { summaryTranslationModelRef.current = summaryTranslationModel; }, [summaryTranslationModel]);
+  useEffect(() => { targetLanguageRef.current = targetLanguage; }, [targetLanguage]);
+  useEffect(() => { customLanguageRef.current = customLanguage; }, [customLanguage]);
+
+  async function translateRunningSummary(text: string) {
+    const language = targetLanguageRef.current === "Other" ? customLanguageRef.current.trim() : targetLanguageRef.current;
+    const modelId = summaryTranslationModelRef.current;
+    if (!text.trim() || !language || !["gpt-6-luna", "gpt-6.1-sol"].includes(modelId)) return;
+    const key = `${language} · ${modelId}`;
+    setSummaryTranslating(true);
+    setSummaryTranslations((current) => ({ ...current, [key]: "" }));
+    setSummaryTranslationDraft("");
+    translatingLanguage.current = `summary:${key}`;
+    try {
+      const translated = await invoke<string>("translate_transcript", { text, targetLanguage: language, model: modelId });
+      setSummaryTranslations((current) => ({ ...current, [key]: translated }));
+      await invoke("save_summary_translation", { sessionId: transcriptSessionId.current, sourceName: transcriptSessionName.current, language, text: translated });
+      await refreshSavedTranscripts();
+    } catch (cause) {
+      setError(`Summary translation failed: ${errorMessage(cause)}`);
+    } finally {
+      translatingLanguage.current = "";
+      setSummaryTranslating(false);
+      setSummaryTranslationDraft("");
+    }
+  }
 
   function queueRunningNotes(text: string) {
     const addition = text.trim();
-    if (!addition || !summaryModeRef.current) return;
+    if (!addition || !summaryModeRef.current || (sourceModeRef.current !== "system" && !completedRef.current)) return;
     summaryQueue.current = summaryQueue.current.then(async () => {
       const notes = await invoke<string>("update_summary_notes", {
         previousNotes: summaryTextRef.current,
@@ -513,7 +626,28 @@ export default function App() {
         text: notes,
       });
       await refreshSavedTranscripts();
+      const liveLanguage = targetLanguageRef.current === "Other" ? customLanguageRef.current.trim() : targetLanguageRef.current;
+      const liveModel = summaryTranslationModelRef.current;
+      if (summaryTranslationLiveRef.current && liveLanguage && ["gpt-6-luna", "gpt-6.1-sol"].includes(liveModel)) await translateRunningSummary(notes);
     }).catch((cause) => { setError(`Running notes failed: ${errorMessage(cause)}`); });
+  }
+
+  function queueMeetingNotes(text: string) {
+    const addition = text.trim();
+    if (!addition || !notesModeRef.current || (sourceModeRef.current !== "system" && !completedRef.current)) return;
+    summaryQueue.current = summaryQueue.current.then(async () => {
+      const notes = await invoke<string>("update_summary_notes", { previousNotes: notesTextRef.current, newTranscript: addition, model: summaryModelRef.current });
+      notesTextRef.current = notes;
+      setNotesText(notes);
+      await invoke("save_transcript_notes", { sessionId: transcriptSessionId.current, name: transcriptSessionName.current, text: notes });
+      await refreshSavedTranscripts();
+    }).catch((cause) => setError(`Notes update failed: ${errorMessage(cause)}`));
+  }
+
+  function startMeetingNotes() {
+    setNotesMode(true);
+    notesModeRef.current = true;
+    if (transcriptRef.current.trim()) queueMeetingNotes(transcriptRef.current);
   }
 
   async function generateFinalSummary(text: string) {
@@ -535,6 +669,7 @@ export default function App() {
       });
       await refreshSavedTranscripts();
       setSummaryStatus("ended");
+      if (summaryTranslationLiveRef.current) await translateRunningSummary(result);
     } catch (cause) {
       setSummaryStatus("failed");
       setError(`Summary failed: ${errorMessage(cause)}`);
@@ -544,10 +679,10 @@ export default function App() {
     }
   }
 
-  async function translateSummary() {
+  async function translateSummary(force = false) {
     if (!summaryText.trim() || !selectedSummaryTranslationModel || !requestedTargetLanguage) return;
     const key = `${requestedTargetLanguage} · ${selectedSummaryTranslationModel.name}`;
-    if (summaryTranslations[key]) return;
+    if (!force && summaryTranslations[key]) return;
     setSummaryTranslating(true);
     setSummaryTranslationDraft("");
     setSummaryTranslations((current) => ({ ...current, [key]: "" }));
@@ -715,57 +850,91 @@ export default function App() {
 
   useEffect(() => {
     void refreshApiKeys();
+    void refreshAdminApiKeys();
+    void refreshProjectUsage();
     void refreshResumableJobs();
     void refreshSavedTranscripts();
     void refreshLibraryFiles();
 
     const unlistenEvent = listen<TranscriptionEvent>("transcription-progress", ({ payload }) => {
-      const globalChunk = (payload.chunk ?? 1) + transcriptionChunkOffset.current;
-      if (payload.totalChunks) currentTranscriptionTotal.current = payload.totalChunks;
+      if (payload.taskSlot === "system") {
+        if (payload.kind === "prompt") setTranscriptionPrompts((current) => ({ ...current, [payload.chunk ?? 0]: payload.prompt ?? null }));
+        return;
+      }
+      if (payload.taskSlot !== "file" && payload.taskSlot !== "online") return;
+      const task = transcriptionTasks.current[payload.taskSlot];
+      if (!task || !task.active || task.id !== payload.taskId) return;
+      const globalChunk = (payload.chunk ?? 1) + task.chunkOffset;
+      const isVisibleTask = sourceModeRef.current === payload.taskSlot;
+      if (payload.totalChunks) {
+        task.totalChunks = payload.totalChunks;
+        if (isVisibleTask) currentTranscriptionTotal.current = payload.totalChunks;
+      }
       if (["preparing", "retrying", "chunk_done", "done", "error"].includes(payload.kind)) {
         const part = payload.chunk ? ` · part ${payload.chunk}${payload.totalChunks ? `/${payload.totalChunks}` : ""}` : "";
-        recordTechnicalLog("Transcription", `${payload.kind}${part}${payload.code ? ` · [${payload.code}]` : ""}${payload.message ? ` · ${payload.message}` : ""}`);
+        recordTechnicalLog(`Transcription · ${payload.taskSlot}`, `${payload.kind}${part}${payload.code ? ` · [${payload.code}]` : ""}${payload.message ? ` · ${payload.message}` : ""}`);
       }
+      const renderTask = () => {
+        const ordered: string[] = [];
+        for (let chunk = 1; chunk <= task.chunkOffset + task.totalChunks; chunk += 1) {
+          ordered.push(task.parts[chunk] ?? "");
+          if (!task.complete.has(chunk)) break;
+        }
+        const text = ordered.join("\n");
+        const tab = transcriptTabs.current[payload.taskSlot];
+        tab.transcript = text;
+        tab.originalTranscript = text;
+        if (isVisibleTask) {
+          transcriptParts.current = { ...task.parts };
+          completedParts.current = new Set(task.complete);
+          transcriptRef.current = text;
+          setTranscript(text);
+          setOriginalTranscript(text);
+        }
+        return text;
+      };
       if (payload.kind === "prompt") {
-        setTranscriptionPrompts((current) => ({ ...current, [payload.chunk ? globalChunk : 0]: payload.prompt ?? null }));
+        if (isVisibleTask) setTranscriptionPrompts((current) => ({ ...current, [payload.chunk ? globalChunk : 0]: payload.prompt ?? null }));
       } else if (payload.kind === "preparing") {
-        setPhase(`File ${currentTranscriptionFile.current}/${audioQueueRef.current.length || 1} · ${payload.message ?? "Preparing audio"}`);
-        setProgress(12);
+        task.phase = `File ${task.fileIndex}/${task.fileCount} · ${payload.message ?? "Preparing audio"}`;
+        task.progress = 12;
+        if (isVisibleTask) { setPhase(task.phase); setProgress(task.progress); }
       } else if (payload.kind === "uploading") {
-        setPhase(`File ${currentTranscriptionFile.current}/${audioQueueRef.current.length || 1} · part ${payload.chunk} of ${payload.totalChunks}`);
-        setProgress(20 + ((payload.chunk ?? 1) - 1) / (payload.totalChunks ?? 1) * 70);
+        task.phase = `File ${task.fileIndex}/${task.fileCount} · part ${payload.chunk} of ${payload.totalChunks}`;
+        task.progress = 20 + ((payload.chunk ?? 1) - 1) / (payload.totalChunks ?? 1) * 70;
+        if (isVisibleTask) { setPhase(task.phase); setProgress(task.progress); }
       } else if (payload.kind === "retrying") {
         if (payload.chunk) {
-          transcriptParts.current[globalChunk] = "";
-          completedParts.current.delete(globalChunk);
-          transcriptAttempts.current[globalChunk] = (transcriptAttempts.current[globalChunk] ?? 0) + 1;
-          renderOrderedTranscript((payload.totalChunks ?? 0) + transcriptionChunkOffset.current);
+          task.parts[globalChunk] = "";
+          task.complete.delete(globalChunk);
+          task.attempts[globalChunk] = (task.attempts[globalChunk] ?? 0) + 1;
+          if (isVisibleTask) transcriptAttempts.current[globalChunk] = task.attempts[globalChunk];
+          renderTask();
         }
-        setPhase(payload.message ?? "A timed-out part is being retried");
+        task.phase = payload.message ?? "A timed-out part is being retried";
+        if (isVisibleTask) setPhase(task.phase);
       } else if (payload.kind === "delta" && payload.delta) {
-        transcriptParts.current[globalChunk] = (transcriptParts.current[globalChunk] ?? "") + payload.delta;
-        persistTranscriptFragment(globalChunk, payload.delta);
-        renderOrderedTranscript((payload.totalChunks ?? 0) + transcriptionChunkOffset.current);
+        task.parts[globalChunk] = (task.parts[globalChunk] ?? "") + payload.delta;
+        task.persistence = task.persistence.then(() => invoke("append_saved_transcript", { sessionId: task.sessionId, chunk: globalChunk, attempt: task.attempts[globalChunk] ?? 0, name: task.sessionName, text: payload.delta })).then(() => undefined).catch((cause) => { if (isVisibleTask) setError(`Transcript is visible but could not be saved: ${errorMessage(cause)}`); });
+        renderTask();
       } else if (payload.kind === "chunk_done") {
         if (payload.chunk) {
-          completedParts.current.add(globalChunk);
+          task.complete.add(globalChunk);
           if (payload.text !== undefined) {
-            transcriptParts.current[globalChunk] = payload.text;
-            replaceSavedTranscriptChunk(globalChunk, transcriptAttempts.current[globalChunk] ?? 0, payload.text);
+            task.parts[globalChunk] = payload.text;
+            task.persistence = task.persistence.then(() => invoke("replace_saved_transcript_chunk", { sessionId: task.sessionId, chunk: globalChunk, attempt: task.attempts[globalChunk] ?? 0, name: task.sessionName, text: payload.text })).then(() => invoke("snapshot_saved_transcript", { sessionId: task.sessionId, name: task.sessionName })).then(() => undefined).catch((cause) => { if (isVisibleTask) setError(`Transcript response could not be saved: ${errorMessage(cause)}`); });
           }
         }
-        snapshotTranscriptFile();
-        renderOrderedTranscript((payload.totalChunks ?? 0) + transcriptionChunkOffset.current);
-        setProgress(20 + completedParts.current.size / (payload.totalChunks ?? 1) * 70);
+        renderTask();
+        if (isVisibleTask && payload.text?.trim()) { queueRunningNotes(payload.text); queueMeetingNotes(payload.text); }
+        task.progress = 20 + task.complete.size / (task.totalChunks || 1) * 70;
+        if (isVisibleTask) setProgress(task.progress);
       } else if (payload.kind === "done") {
-        setPhase("Transcription complete");
-        setProgress(100);
-        snapshotTranscriptFile();
-        if (!batchTranscriptionActive.current) {
-          setCompleted(true);
-          cleanupSavedTranscriptChunks();
-        }
-        void transcriptPersistenceQueue.current.then(refreshSavedTranscripts);
+        task.phase = "Transcription complete";
+        task.progress = 100;
+        if (isVisibleTask) { setPhase(task.phase); setProgress(task.progress); }
+        task.persistence = task.persistence.then(() => invoke("snapshot_saved_transcript", { sessionId: task.sessionId, name: task.sessionName })).then(() => undefined).catch(() => undefined);
+        void task.persistence.then(() => refreshSavedTranscripts());
       }
     });
 
@@ -815,7 +984,7 @@ export default function App() {
     });
 
     const unlistenTranslation = listen<TranslationEvent>("translation-progress", ({ payload }) => {
-      if (payload.kind === "done") recordTechnicalLog("Translation", `Completed ${payload.totalChunks} part(s).`);
+      if (payload.kind === "done") { recordTechnicalLog("Translation", `Completed ${payload.totalChunks} part(s).`); void refreshUsage(); }
       const language = translatingLanguage.current;
       if (payload.kind === "delta" && payload.delta && language) {
         if (language.startsWith("summary:")) {
@@ -827,12 +996,39 @@ export default function App() {
     });
 
     const unlistenSystemAudio = listen<SystemAudioEvent>("system-audio-progress", ({ payload }) => {
-      if (["warning", "error", "done"].includes(payload.kind)) {
+      if (["warning", "error", "done", "capture_stopped"].includes(payload.kind)) {
         recordTechnicalLog("Audio capture", `${payload.kind}${payload.chunk ? ` · part ${payload.chunk}` : ""}${payload.code ? ` · [${payload.code}]` : ""}${payload.message ? ` · ${payload.message}` : ""}`);
+      }
+      if (sourceModeRef.current !== "system") {
+        if (payload.kind === "transcript" && payload.text !== undefined) {
+          const tab = transcriptTabs.current.system;
+          const next = `${tab.transcript}${tab.transcript ? "\n" : ""}${payload.text}`;
+          tab.transcript = next;
+          tab.originalTranscript = next;
+          const sessionId = tab.sessionId;
+          const name = tab.sessionName;
+          if (sessionId) void invoke("replace_final_transcript", { sessionId, name, text: next }).then(refreshSavedTranscripts).catch((cause) => setError(`Background capture transcript save failed: ${errorMessage(cause)}`));
+          return;
+        }
+        if (payload.kind === "done") {
+          const tab = transcriptTabs.current.system;
+          tab.completed = true;
+          tab.summaryMode = false;
+          setSystemRecording(false);
+          setSystemStopping(false);
+          return;
+        }
+        if (payload.kind !== "error" && payload.kind !== "warning") return;
       }
       if (payload.kind === "queue") {
         setSystemQueuedChunks(payload.queuedChunks);
         setSystemActiveRequests(payload.activeRequests);
+      } else if (payload.kind === "capture_stopped") {
+        setSystemRecording(false);
+        setSystemStopping(true);
+        setSystemQueuedChunks(payload.queuedChunks);
+        setSystemActiveRequests(payload.activeRequests);
+        setPhase("Audio input stopped; finishing captured parts");
       } else if (payload.kind === "status") {
         setSystemElapsed(payload.elapsedSeconds);
         setSystemChunkElapsed(payload.chunkSeconds);
@@ -854,6 +1050,7 @@ export default function App() {
         persistTranscriptFragment(payload.chunk ?? systemCompletedChunks + 1, payload.text);
         snapshotTranscriptFile();
         queueRunningNotes(payload.text);
+        queueMeetingNotes(payload.text);
         setSystemCompletedChunks(payload.completedChunks);
         setSystemQueuedChunks(payload.queuedChunks);
       } else if (payload.kind === "error") {
@@ -876,6 +1073,22 @@ export default function App() {
       if (["reconnecting", "error", "done"].includes(payload.kind)) {
         recordTechnicalLog("Live audio", `${payload.kind}${payload.code ? ` · [${payload.code}]` : ""}${payload.message ? ` · ${payload.message}` : ""}`);
       }
+      if (sourceModeRef.current !== "system") {
+        const tab = transcriptTabs.current.system;
+        if (payload.kind === "transcript" && payload.transcript !== undefined && !payload.partial) {
+          tab.transcript = payload.transcript;
+          tab.originalTranscript = payload.transcript;
+          if (tab.sessionId) void invoke("replace_final_transcript", { sessionId: tab.sessionId, name: tab.sessionName, text: payload.transcript }).then(refreshSavedTranscripts).catch((cause) => setError(`Background capture transcript save failed: ${errorMessage(cause)}`));
+          return;
+        }
+        if (payload.kind === "done") {
+          tab.completed = true;
+          setLiveRecording(false);
+          setLiveStopping(false);
+          return;
+        }
+        if (payload.kind !== "error") return;
+      }
       setLiveElapsed(payload.elapsedSeconds);
       setLiveEstimatedCost(payload.estimatedCost);
       if (payload.kind === "transcript" && payload.transcript !== undefined) {
@@ -885,6 +1098,7 @@ export default function App() {
         if (!payload.partial) {
           if (payload.transcript.startsWith(liveFinalTranscript.current)) {
             queueRunningNotes(payload.transcript.slice(liveFinalTranscript.current.length));
+            queueMeetingNotes(payload.transcript.slice(liveFinalTranscript.current.length));
           }
           liveFinalTranscript.current = payload.transcript;
         }
@@ -918,6 +1132,7 @@ export default function App() {
 
     const unlistenSummary = listen<SummaryEvent>("summary-progress", ({ payload }) => {
       if (payload.kind === "start" || payload.kind === "done") recordTechnicalLog("Summary", `${payload.mode} ${payload.kind}.`);
+      if (payload.kind === "done") void refreshUsage();
       if (payload.mode === "question" && payload.kind === "delta" && payload.delta) {
         setQuestionDraft((current) => current + payload.delta);
       } else if (payload.mode === "summary" && payload.kind === "delta" && payload.delta) {
@@ -1060,7 +1275,7 @@ export default function App() {
     ...Object.entries(translations).map(([language, text]) => ({ language, text })),
   ];
   const progressStyle = useMemo(() => ({ "--progress": `${progress}%` } as React.CSSProperties), [progress]);
-  const backgroundWorkActive = busy || onlineExtracting || onlineInspecting || webPageInspecting || localImporting || systemRecording || liveRecording || systemStopping || liveStopping || translating || summaryTranslating || questionBusy || summaryGenerating || enhancementRunning;
+  const backgroundWorkActive = transcriptionBusyBySlot.file || transcriptionBusyBySlot.online || onlineExtracting || onlineInspecting || webPageInspecting || localImporting || systemRecording || liveRecording || systemStopping || liveStopping || translating || summaryTranslating || questionBusy || summaryGenerating || enhancementRunning;
   const onlineDownloadLabel = (() => {
     if (!onlineExtracting || !onlineDownloadProgress) return null;
     if (onlineDownloadProgress.downloadedBytes !== undefined) {
@@ -1094,6 +1309,7 @@ export default function App() {
       livePersistedTranscript.current = "";
       setSummaryText("");
       summaryTextRef.current = "";
+      setNotesText(""); notesTextRef.current = ""; setNotesMode(false); notesModeRef.current = false; setSummaryTranslationLive(false); summaryTranslationLiveRef.current = false;
       setSummaryDraft("");
       setSummaryStatus("idle");
       setSummaryTranslations({});
@@ -1128,6 +1344,7 @@ export default function App() {
   }
 
   async function chooseAudio(appendToQueue = false) {
+    if (transcriptionBusyBySlot.file) return;
     const selected = await open({
       multiple: true,
       directory: false,
@@ -1186,7 +1403,7 @@ export default function App() {
 
   async function inspectOnline(urlOverride?: string) {
     const url = (urlOverride ?? onlineUrl).trim();
-    if (!url || onlineInspecting || webPageInspecting || onlineExtracting) return;
+    if (!url || onlineInspecting || webPageInspecting || onlineExtracting || transcriptionBusyBySlot.online) return;
     if (urlOverride) setOnlineUrl(url);
     startTechnicalTask(classifyOnlineUrl(url) === "web" ? "Web page inspection" : "Online media inspection");
     setError("");
@@ -1252,7 +1469,7 @@ export default function App() {
   }
 
   async function extractOnlineAudio(_allowReencode = false, downloadApproved = false) {
-    if (!onlineMedia || onlineExtracting) return;
+    if (!onlineMedia || onlineExtracting || transcriptionBusyBySlot.online) return;
     if (!downloadApproved) {
       setOnlineConversionApproved(false);
       setLargeDownloadOpen(true);
@@ -1282,6 +1499,7 @@ export default function App() {
       transcriptRef.current = "";
       setSummaryText("");
       summaryTextRef.current = "";
+      setNotesText(""); notesTextRef.current = ""; setNotesMode(false); notesModeRef.current = false; setSummaryTranslationLive(false); summaryTranslationLiveRef.current = false;
       setSummaryDraft("");
       transcriptParts.current = {};
       completedParts.current.clear();
@@ -1335,6 +1553,7 @@ export default function App() {
   }
 
   async function transcribe() {
+    if (sourceMode === "system" || transcriptionBusyBySlot[sourceMode]) return;
     if (!audio || !selectedAudioTrack) return;
     if (!selectedKey) {
       setSettingsOpen(true);
@@ -1357,11 +1576,14 @@ export default function App() {
 
   async function runTranscription(allowReencode: boolean) {
     if (!audio || !selectedModel || selectedAudioStreamIndex === null) return;
-    const sources = audioOwner === "file" && audioQueue.length ? audioQueue : [audio];
+    const taskSlot = audioOwner;
+    if (transcriptionBusyBySlot[taskSlot]) return;
+    const taskId = crypto.randomUUID();
+    const sources = taskSlot === "file" && audioQueue.length ? audioQueue : [audio];
     startTechnicalTask(sources.length > 1 ? `Transcription · ${sources.length} audio files` : `Transcription ${audio.name}`);
-    recordTechnicalLog("Model", `Selected ${model}.`);
-    setBusy(true);
-    setTranscriptionCancelRequested(false);
+    recordTechnicalLog(`Model · ${taskSlot}`, `Selected ${model}.`);
+    setTranscriptionBusyBySlot((current) => ({ ...current, [taskSlot]: true }));
+    setTranscriptionCancelBySlot((current) => ({ ...current, [taskSlot]: false }));
     setCompleted(false);
     setError("");
     setTranscript("");
@@ -1370,6 +1592,7 @@ export default function App() {
     transcriptRef.current = "";
     setSummaryText("");
     summaryTextRef.current = "";
+    setNotesText(""); notesTextRef.current = ""; setNotesMode(false); notesModeRef.current = false; setSummaryTranslationLive(false); summaryTranslationLiveRef.current = false;
     setSummaryDraft("");
     setSummaryStatus(summaryModeRef.current ? "started" : "idle");
     setSummaryTranslations({});
@@ -1381,7 +1604,10 @@ export default function App() {
     setTranslationEnabled(false);
     setActiveLanguage("Original");
     const sessionName = sources.length > 1 ? `${sources[0].name} + ${sources.length - 1} parts` : sources[0].name;
-    startTranscriptSession(sessionName);
+    const sessionId = startTranscriptSession(sessionName);
+    const task = { id: taskId, sessionId, sessionName, chunkOffset: 0, totalChunks: 0, fileIndex: 1, fileCount: sources.length, active: true, parts: {} as Record<number, string>, complete: new Set<number>(), attempts: {} as Record<number, number>, persistence: Promise.resolve(), phase: "Starting transcription", progress: 4, error: "" };
+    transcriptionTasks.current[taskSlot] = task;
+    Object.assign(transcriptTabs.current[taskSlot], { transcript: "", originalTranscript: "", enhancedTranscript: "", summaryText: "", notesText: "", translations: {}, summaryTranslations: {}, questionMessages: [], activeLanguage: "Original", completed: false, summaryMode: false, notesMode: false, sessionId, sessionName });
     transcriptionChunkOffset.current = 0;
     currentTranscriptionTotal.current = 0;
     batchTranscriptionActive.current = sources.length > 1;
@@ -1390,6 +1616,7 @@ export default function App() {
     try {
       const results: string[] = [];
       for (const [index, source] of sources.entries()) {
+        task.fileIndex = index + 1;
         currentTranscriptionFile.current = index + 1;
         currentTranscriptionTotal.current = 0;
         setCompleted(false);
@@ -1402,81 +1629,98 @@ export default function App() {
           model,
           parallelRequests,
           jobId: crypto.randomUUID(),
+          taskId,
+          taskSlot,
+          taskComplete: index === sources.length - 1,
           contextPrompt: source.contextPrompt || (source.path === audio.path ? transcriptionContextPrompt : "") || null,
         };
         results.push(await invoke<string>("transcribe_audio", { request }));
-        transcriptionChunkOffset.current += currentTranscriptionTotal.current;
+        task.chunkOffset += task.totalChunks;
       }
       const finalText = results.filter((text) => text.trim()).join("\n\n");
-      setTranscript(finalText);
-      transcriptRef.current = finalText;
-      setCompleted(true);
-      setPhase("Transcription complete");
-      setProgress(100);
-      await transcriptPersistenceQueue.current;
-      await invoke("replace_final_transcript", { sessionId: transcriptSessionId.current, name: transcriptSessionName.current, text: finalText });
-      cleanupSavedTranscriptChunks();
+      Object.assign(transcriptTabs.current[taskSlot], { transcript: finalText, originalTranscript: finalText, completed: true });
+      task.persistence = task.persistence.then(() => invoke("replace_final_transcript", { sessionId: task.sessionId, name: task.sessionName, text: finalText })).then(() => invoke("cleanup_saved_transcript_chunks", { sessionId: task.sessionId })).then(() => undefined).catch((cause) => { if (sourceModeRef.current === taskSlot) setError(`Transcript completed but could not be finalized in Library: ${errorMessage(cause)}`); });
+      await task.persistence;
+      if (sourceModeRef.current === taskSlot && transcriptionTasks.current[taskSlot]?.id === taskId) {
+        setTranscript(finalText);
+        transcriptRef.current = finalText;
+        setOriginalTranscript(finalText);
+        setCompleted(true);
+        setPhase("Transcription complete");
+        setProgress(100);
+      }
       await refreshSavedTranscripts();
-      if (summaryModeRef.current) await generateFinalSummary(finalText);
+      if (sourceModeRef.current === taskSlot && summaryModeRef.current) await generateFinalSummary(finalText);
       await refreshResumableJobs();
     } catch (cause) {
       const message = errorMessage(cause);
-      recordTechnicalLog("Transcription", `Failed: ${message}`);
+      recordTechnicalLog(`Transcription · ${taskSlot}`, `Failed: ${message}`);
       if (message.includes("REENCODE_APPROVAL_REQUIRED")) {
-        setPendingConversion("file");
-        setConversionOpen(true);
-        setPhase("Conversion approval required");
+        task.phase = "Conversion approval required";
+        task.error = message;
+        setPendingConversion(taskSlot);
+        if (sourceModeRef.current === taskSlot) { setConversionOpen(true); setPhase("Conversion approval required"); }
       } else {
-        setError(message);
-        setPhase("Transcription could not be completed");
+        task.phase = "Transcription could not be completed";
+        task.error = message;
+        if (sourceModeRef.current === taskSlot) { setError(message); setPhase("Transcription could not be completed"); }
         void refreshResumableJobs();
       }
     } finally {
       batchTranscriptionActive.current = false;
-      setBusy(false);
-      setTranscriptionCancelRequested(false);
-      await transcriptPersistenceQueue.current;
+      setTranscriptionBusyBySlot((current) => ({ ...current, [taskSlot]: false }));
+      setTranscriptionCancelBySlot((current) => ({ ...current, [taskSlot]: false }));
+      task.active = false;
+      await task.persistence;
       await refreshSavedTranscripts();
     }
   }
 
   async function cancelTranscription() {
-    if (!busy || transcriptionCancelRequested) return;
-    setTranscriptionCancelRequested(true);
-    setPhase("Canceling the current upload and saving completed chunks");
-    try { await invoke("cancel_transcription"); }
+    if (sourceMode === "system" || !busy || transcriptionCancelRequested) return;
+    const taskSlot = sourceMode;
+    const taskId = transcriptionTasks.current[taskSlot]?.id;
+    if (!taskId) return;
+    setTranscriptionCancelBySlot((current) => ({ ...current, [taskSlot]: true }));
+    setPhase("Canceling this task and saving completed chunks");
+    try { await invoke("cancel_transcription", { taskId, taskSlot }); }
     catch (cause) { setError(errorMessage(cause)); }
   }
 
   async function resumeJob(job: ResumableJob) {
-    if (busy) return;
-    setBusy(true);
-    setTranscriptionCancelRequested(false);
+    if (transcriptionBusyBySlot.file) return;
+    const taskSlot = "file" as const;
+    const taskId = crypto.randomUUID();
+    setTranscriptionBusyBySlot((current) => ({ ...current, file: true }));
+    setTranscriptionCancelBySlot((current) => ({ ...current, file: false }));
     setCompleted(false);
     setError("");
     setTranscript("");
     transcriptRef.current = "";
-    startTranscriptSession(job.sourceName);
+    const sessionId = startTranscriptSession(job.sourceName);
+    const task = { id: taskId, sessionId, sessionName: job.sourceName, chunkOffset: 0, totalChunks: job.totalChunks, fileIndex: 1, fileCount: 1, active: true, parts: {} as Record<number, string>, complete: new Set<number>(), attempts: {} as Record<number, number>, persistence: Promise.resolve(), phase: `Resuming ${job.sourceName}`, progress: 4, error: "" };
+    transcriptionTasks.current.file = task;
+    Object.assign(transcriptTabs.current.file, { transcript: "", originalTranscript: "", sessionId, sessionName: job.sourceName, completed: false });
     transcriptParts.current = {};
     completedParts.current.clear();
     setProgress(4);
     setPhase(`Resuming ${job.sourceName} · ${job.completedChunks}/${job.totalChunks} chunks already complete`);
     try {
-      const finalText = await invoke<string>("resume_transcription", { jobId: job.id });
-      setTranscript(finalText);
-      transcriptRef.current = finalText;
-      setCompleted(true);
-      setProgress(100);
-      setPhase("Transcription complete");
-      await transcriptPersistenceQueue.current;
+      const finalText = await invoke<string>("resume_transcription", { jobId: job.id, taskId, taskSlot });
+      task.persistence = task.persistence.then(() => invoke("replace_final_transcript", { sessionId, name: job.sourceName, text: finalText })).then(() => invoke("cleanup_saved_transcript_chunks", { sessionId })).then(() => undefined).catch((cause) => { if (sourceModeRef.current === "file") setError(`Transcript completed but could not be finalized in Library: ${errorMessage(cause)}`); });
+      await task.persistence;
+      Object.assign(transcriptTabs.current.file, { transcript: finalText, originalTranscript: finalText, completed: true, sessionId, sessionName: job.sourceName });
+      if (sourceModeRef.current === "file") { setTranscript(finalText); transcriptRef.current = finalText; setCompleted(true); setProgress(100); setPhase("Transcription complete"); }
       await refreshSavedTranscripts();
-      if (summaryModeRef.current) await generateFinalSummary(finalText);
+      if (sourceModeRef.current === "file" && summaryModeRef.current) await generateFinalSummary(finalText);
     } catch (cause) {
-      setError(errorMessage(cause));
-      setPhase("Transcription could not be resumed");
+      task.phase = "Transcription could not be resumed";
+      task.error = errorMessage(cause);
+      if (sourceModeRef.current === "file") { setError(errorMessage(cause)); setPhase(task.phase); }
     } finally {
-      setBusy(false);
-      setTranscriptionCancelRequested(false);
+      setTranscriptionBusyBySlot((current) => ({ ...current, file: false }));
+      setTranscriptionCancelBySlot((current) => ({ ...current, file: false }));
+      task.active = false;
       await refreshResumableJobs();
       await transcriptPersistenceQueue.current;
       await refreshSavedTranscripts();
@@ -1498,6 +1742,7 @@ export default function App() {
     liveFinalTranscript.current = "";
     setSummaryText("");
     summaryTextRef.current = "";
+    setNotesText(""); notesTextRef.current = ""; setNotesMode(false); notesModeRef.current = false; setSummaryTranslationLive(false); summaryTranslationLiveRef.current = false;
     setSummaryDraft("");
     setTranslations({});
     setTranslationEnabled(false);
@@ -1644,6 +1889,7 @@ export default function App() {
     liveFinalTranscript.current = "";
     setSummaryText("");
     summaryTextRef.current = "";
+    setNotesText(""); notesTextRef.current = ""; setNotesMode(false); notesModeRef.current = false; setSummaryTranslationLive(false); summaryTranslationLiveRef.current = false;
     setSummaryDraft("");
     setSummaryStatus("idle");
     setSummaryTranslations({});
@@ -1664,14 +1910,16 @@ export default function App() {
     <div className="app-shell">
       <nav>
         <div className="brand"><span className="brand-mark"><AudioLines size={19} /></span>Minefia <em>Audio</em></div>
-        <div className="nav-actions">
+        {(workspaceReady || accessState === "error") && <div className="nav-actions">
           <button className="settings-button library-nav-button" onClick={() => { setLibraryOpen(true); void refreshLibraryFiles(); void refreshSavedTranscripts(); }}><FolderOpen size={16} /> Library</button>
+          {adminApiKeys.length > 0 && projectUsageReady && <button className="settings-button" onClick={() => { setUsageOpen(true); void refreshUsage(); }}><CircleDollarSign size={16} /> Usage</button>}
+          {(systemRecording || liveRecording) && <button className="settings-button capture-stop-nav" onClick={() => void stopSystemAudio()} disabled={systemStopping || liveStopping}><Radio size={15} /> {systemStopping || liveStopping ? "Finishing capture…" : "Stop capture"}</button>}
           <button className="settings-button" onClick={() => setSettingsOpen(true)}>
             <span className={`status-dot ${workspaceReady ? "connected" : selectedKey ? "error" : ""}`} />
             {selectedKey ? selectedKey.label : "Set up API key"}
             <Settings size={17} />
           </button>
-        </div>
+        </div>}
       </nav>
 
       <main className={workspaceReady ? undefined : "access-main"}>
@@ -1680,8 +1928,9 @@ export default function App() {
             state={accessState}
             keyLabel={selectedKey?.label}
             error={accessState === "error" ? accessError : undefined}
+            adminKeys={adminApiKeys}
             onOpenSettings={() => setSettingsOpen(true)}
-            onRetry={() => void refreshApiKeys()}
+            onRetry={refreshSettingsKeys}
           />
         ) : <>
           <header className="hero">
@@ -1691,17 +1940,17 @@ export default function App() {
         </header>
 
         <div className="source-mode-tabs" role="tablist" aria-label="Transcription source">
-          <button className={sourceMode === "file" ? "selected" : ""} onClick={() => switchSourceMode("file")} disabled={busy || summaryGenerating || summaryTranslating || questionBusy || translating || enhancementRunning || onlineInspecting || onlineExtracting || systemRecording || liveRecording || systemStopping || liveStopping}><FileAudio size={15} /> Local file</button>
-          <button className={sourceMode === "online" ? "selected" : ""} onClick={() => switchSourceMode("online")} disabled={busy || summaryGenerating || summaryTranslating || questionBusy || translating || enhancementRunning || onlineInspecting || onlineExtracting || webPageInspecting || systemRecording || liveRecording || systemStopping || liveStopping}><Globe size={15} /> Online media</button>
-          <button className={sourceMode === "system" ? "selected" : ""} onClick={() => switchSourceMode("system")} disabled={busy || summaryGenerating || summaryTranslating || questionBusy || translating || enhancementRunning || onlineInspecting || onlineExtracting || systemRecording || liveRecording || systemStopping || liveStopping}><MonitorSpeaker size={15} /> Audio capture</button>
+          <button className={sourceMode === "file" ? "selected" : ""} onClick={() => switchSourceMode("file")} disabled={summaryGenerating || summaryTranslating || questionBusy || translating || enhancementRunning || onlineInspecting || onlineExtracting || systemStopping || liveStopping}><FileAudio size={15} /> Local file{transcriptionBusyBySlot.file && <i className="tab-busy-dot" />}</button>
+          <button className={sourceMode === "online" ? "selected" : ""} onClick={() => switchSourceMode("online")} disabled={summaryGenerating || summaryTranslating || questionBusy || translating || enhancementRunning || onlineInspecting || onlineExtracting || webPageInspecting || systemStopping || liveStopping}><Globe size={15} /> Online media{transcriptionBusyBySlot.online && <i className="tab-busy-dot" />}</button>
+          <button className={sourceMode === "system" ? "selected" : ""} onClick={() => switchSourceMode("system")} disabled={summaryGenerating || summaryTranslating || questionBusy || translating || enhancementRunning || onlineInspecting || onlineExtracting || systemStopping || liveStopping}><MonitorSpeaker size={15} /> Audio capture</button>
         </div>
 
         <section className="workspace-grid">
           <div className="input-column">
-            {resumableJobs.length > 0 && <div className="resumable-jobs card"><strong>Interrupted transcription jobs</strong><p>Completed chunks are saved and will not be uploaded again.</p>{resumableJobs.map((job) => <div className="resumable-job" key={job.id}><span><b>{job.sourceName}</b><small>{job.completedChunks}/{job.totalChunks} chunks · {job.model}</small></span><button onClick={() => void resumeJob(job)} disabled={busy}>{busy ? "Working…" : "Resume"}</button></div>)}</div>}
+            {resumableJobs.length > 0 && <div className="resumable-jobs card"><strong>Interrupted transcription jobs</strong><p>Completed chunks are saved and will not be uploaded again.</p>{resumableJobs.map((job) => <div className="resumable-job" key={job.id}><span><b>{job.sourceName}</b><small>{job.completedChunks}/{job.totalChunks} chunks · {job.model}</small></span><button onClick={() => void resumeJob(job)} disabled={transcriptionBusyBySlot.file}>{transcriptionBusyBySlot.file ? "Working…" : "Resume"}</button></div>)}</div>}
             {sourceMode === "file" ? <>
             {!audio || audioOwner !== "file" ? (
-              <button className={`drop-zone ${dragging ? "dragging" : ""}`} onClick={() => void chooseAudio()} disabled={localImporting}>
+              <button className={`drop-zone ${dragging ? "dragging" : ""}`} onClick={() => void chooseAudio()} disabled={localImporting || transcriptionBusyBySlot.file}>
                 <span className="upload-orbit">{localImporting ? <Loader2 className="spin" size={24} /> : <Upload size={24} />}</span>
                 <strong>Drop an audio or video file here</strong>
               <span>or click to choose one or more files</span>
@@ -1808,17 +2057,17 @@ export default function App() {
             </> : sourceMode === "online" ? <>
               {onlineMedia && <div className="online-media-card card">
                 <div className="system-audio-heading"><span className="system-audio-icon"><AudioLines size={21} /></span><div><p>{onlineMedia.sourceKind}</p><h3>{onlineMedia.title}</h3></div><span className="standard-badge"><i />AUDIO FOUND</span></div>
-                {onlineMedia.availableFormats.length > 1 && <label className="online-quality-select"><span>Audio quality</span><select value={onlineMedia.formatId} onChange={(event) => selectOnlineFormat(event.target.value)} disabled={onlineExtracting}>{onlineMedia.availableFormats.map((format) => <option value={format.formatId} key={format.formatId}>{format.recommended ? `Best audio quality (recommended) · ${format.formatLabel}` : format.formatLabel}</option>)}</select><small>Best audio quality chooses the highest available audio bitrate and sample rate. Audio-only formats avoid downloading video; video-containing formats are temporary and only their audio is kept.</small></label>}
+                {onlineMedia.availableFormats.length > 1 && <label className="online-quality-select"><span>Audio quality</span><select value={onlineMedia.formatId} onChange={(event) => selectOnlineFormat(event.target.value)} disabled={onlineExtracting || transcriptionBusyBySlot.online}>{onlineMedia.availableFormats.map((format) => <option value={format.formatId} key={format.formatId}>{format.recommended ? `Best audio quality (recommended) · ${format.formatLabel}` : format.formatLabel}</option>)}</select><small>Best audio quality chooses the highest available audio bitrate and sample rate. Audio-only formats avoid downloading video; video-containing formats are temporary and only their audio is kept.</small></label>}
                 <div className="online-format"><small>SELECTED FORMAT</small><strong>{onlineMedia.formatLabel}</strong><span>{onlineMedia.audioOnly ? "Audio-only stream · no video download" : "Audio and video stream · video will be temporary"}</span></div>
                 <p className="online-quality-note">Minefia keeps the original audio quality and does not re-encode the downloaded audio.</p>
-                {onlineMedia.hasVideo && <label className="keep-video-option"><input type="checkbox" checked={onlineKeepVideo} onChange={(event) => setOnlineKeepVideo(event.target.checked)} disabled={onlineExtracting} /><span><strong>Keep downloaded video in app storage</strong><small>Off by default. The temporary video is removed after audio extraction.</small></span></label>}
-                <button className="primary-button transcribe-button" onClick={() => void extractOnlineAudio()} disabled={onlineExtracting}>{onlineExtracting ? <Loader2 className="spin" size={18} /> : <AudioLines size={18} />}{onlineCancelRequested ? "Canceling…" : onlineExtracting ? "Extracting audio…" : "Extract audio"}{!onlineExtracting && <ArrowRight size={18} />}</button>
+                {onlineMedia.hasVideo && <label className="keep-video-option"><input type="checkbox" checked={onlineKeepVideo} onChange={(event) => setOnlineKeepVideo(event.target.checked)} disabled={onlineExtracting || transcriptionBusyBySlot.online} /><span><strong>Keep downloaded video in app storage</strong><small>Off by default. The temporary video is removed after audio extraction.</small></span></label>}
+                <button className="primary-button transcribe-button" onClick={() => void extractOnlineAudio()} disabled={onlineExtracting || transcriptionBusyBySlot.online}>{onlineExtracting ? <Loader2 className="spin" size={18} /> : <AudioLines size={18} />}{onlineCancelRequested ? "Canceling…" : onlineExtracting ? "Extracting audio…" : "Extract audio"}{!onlineExtracting && <ArrowRight size={18} />}</button>
                 {onlineExtracting && <button className="online-cancel-button" onClick={() => void cancelOnlineExtraction()} disabled={onlineCancelRequested}>{onlineCancelRequested ? "Cancel requested" : "Cancel extraction"}</button>}
               </div>}
               {webPageInfo && <div className="page-media-card card">
                 <div className="section-label"><AudioLines size={15} /><span>Loaded sources · {webPageInfo.pageTitle}</span></div>
-                {webPageInfo.media.map((item, index) => <div className="page-media-item" key={`${item.url}-${index}`}><div><strong>{item.label}</strong><small>{item.contentType || `${item.kind === "audio" ? "Audio" : "Video"} source`}{item.durationSeconds ? ` · ${formatDuration(item.durationSeconds)}` : ""}</small><code>{item.url}</code></div><button onClick={() => inspectPageSource(item.url)} disabled={onlineInspecting || onlineExtracting}>Inspect source</button></div>)}
-                {webPageInfo.masterPlaylists.map((url) => <div className="page-media-item" key={url}><div><strong>HLS master playlist</strong><small>Discovered from the browser network response</small><code>{url}</code></div><button onClick={() => inspectPageSource(url)} disabled={onlineInspecting || onlineExtracting}>Inspect HLS</button></div>)}
+                {webPageInfo.media.map((item, index) => <div className="page-media-item" key={`${item.url}-${index}`}><div><strong>{item.label}</strong><small>{item.contentType || `${item.kind === "audio" ? "Audio" : "Video"} source`}{item.durationSeconds ? ` · ${formatDuration(item.durationSeconds)}` : ""}</small><code>{item.url}</code></div><button onClick={() => inspectPageSource(item.url)} disabled={onlineInspecting || onlineExtracting || transcriptionBusyBySlot.online}>Inspect source</button></div>)}
+                {webPageInfo.masterPlaylists.map((url) => <div className="page-media-item" key={url}><div><strong>HLS master playlist</strong><small>Discovered from the browser network response</small><code>{url}</code></div><button onClick={() => inspectPageSource(url)} disabled={onlineInspecting || onlineExtracting || transcriptionBusyBySlot.online}>Inspect HLS</button></div>)}
                 {webPageInfo.media.length === 0 && webPageInfo.masterPlaylists.length === 0 && <p className="validation-note">No currently loaded source was found.</p>}
               </div>}
               {audio && audioOwner === "online" && <div className="file-card card">
@@ -1828,7 +2077,7 @@ export default function App() {
               <div className="online-input-card card">
                 <div className="section-label"><Globe size={15} /><span>Paste a URL</span></div>
                 <p>Paste a YouTube link, HLS playlist, direct media URL, or webpage. Minefia detects the source type and checks for audio automatically. Only public or otherwise authorized sources are supported.</p>
-                <div className="online-url-row"><input type="url" value={onlineUrl} onChange={(event) => setOnlineUrl(event.target.value)} placeholder="https://…" disabled={onlineInspecting || webPageInspecting || onlineExtracting} onKeyDown={(event) => { if (event.key === "Enter") void inspectOnline(); }} /><button onClick={() => void inspectOnline()} disabled={!onlineUrl.trim() || onlineInspecting || webPageInspecting || onlineExtracting}>{onlineInspecting || webPageInspecting ? <Loader2 className="spin" size={15} /> : <AudioLines size={15} />}{onlineInspecting || webPageInspecting ? "Checking…" : "Inspect"}</button></div>
+                <div className="online-url-row"><input type="url" value={onlineUrl} onChange={(event) => setOnlineUrl(event.target.value)} placeholder="https://…" disabled={onlineInspecting || webPageInspecting || onlineExtracting || transcriptionBusyBySlot.online} onKeyDown={(event) => { if (event.key === "Enter") void inspectOnline(); }} /><button onClick={() => void inspectOnline()} disabled={!onlineUrl.trim() || onlineInspecting || webPageInspecting || onlineExtracting || transcriptionBusyBySlot.online}>{onlineInspecting || webPageInspecting ? <Loader2 className="spin" size={15} /> : <AudioLines size={15} />}{onlineInspecting || webPageInspecting ? "Checking…" : "Inspect"}</button></div>
                 <small className="online-privacy-note">HLS playlists and direct media are inspected directly. For webpages, Minefia checks loaded media and network requests in its private browser. DRM, login walls, and access controls are not bypassed.</small>
               </div>
 
@@ -1879,11 +2128,11 @@ export default function App() {
                 <small>Recording begins only after you press Start.</small>
               </div>}
 
-              <div className={`system-audio-card card ${(systemRecording || liveRecording) ? "recording" : ""}`}>
+              <div className={`system-audio-card card ${(systemRecording || liveRecording) ? "recording" : systemStopping ? "stopping" : ""}`}>
                 <div className="system-audio-heading">
                   <span className="system-audio-icon">{captureSource === "microphone" ? <AudioLines size={22} /> : <MonitorSpeaker size={22} />}</span>
                   <div><p>{captureSource === "both" ? "System Audio + Microphone" : captureSource === "system" ? "System Audio" : "Microphone"}</p><h3>{captureMode === "standard" ? "Standard Mode" : "Live Mode"}</h3></div>
-                  <span className="standard-badge"><i />{systemRecording || liveRecording ? "RECORDING" : "READY"}</span>
+                  <span className="standard-badge"><i />{systemRecording || liveRecording ? "RECORDING" : systemStopping ? "FINISHING" : "READY"}</span>
                 </div>
                 {captureMode === "standard" ? <>
                   <div className="system-metrics">
@@ -1982,7 +2231,7 @@ export default function App() {
               </details>
             </div>}
 
-            {(completed || systemRecording || liveRecording || summaryText) && (
+            {(sourceMode === "system" || completed) && (completed || busy || onlineExtracting || systemRecording || liveRecording || summaryText || notesText || Boolean(audio && audioOwner === sourceMode)) && (
               <details className="summary-panel" open>
                 <summary className="summary-panel-heading">
                   <div><p className="eyebrow">MARKDOWN · STREAMING SUMMARY</p><h3>{systemRecording || liveRecording ? "Running bullet notes" : "Transcript summary"}</h3></div>
@@ -2027,6 +2276,12 @@ export default function App() {
                       {TRANSLATION_LANGUAGES.map((language) => <option key={language}>{language}</option>)}<option value="Other">Other language…</option>
                     </select>
                     {!summaryTranslations[`${requestedTargetLanguage} · ${selectedSummaryTranslationModel?.name ?? ""}`] && <button onClick={() => void translateSummary()} disabled={summaryTranslating || translating || !selectedSummaryTranslationModel || (targetLanguage === "Other" && !customLanguage.trim())}>{summaryTranslating ? <><Loader2 className="spin" size={13} /> Translating…</> : "Translate summary"}</button>}
+                    <button className={summaryTranslationLive ? "selected" : ""} onClick={() => {
+                      const enabled = !summaryTranslationLive;
+                      setSummaryTranslationLive(enabled);
+                      summaryTranslationLiveRef.current = enabled;
+                      if (enabled && summaryText.trim() && selectedSummaryTranslationModel && requestedTargetLanguage) void translateSummary(true);
+                    }} disabled={!selectedSummaryTranslationModel || (targetLanguage === "Other" && !customLanguage.trim())}>{summaryTranslationLive ? "Stop live translation" : "Translate as summary updates"}</button>
                   </div>
                   {targetLanguage === "Other" && <input className="custom-language" value={customLanguage} onChange={(event) => setCustomLanguage(event.target.value)} placeholder="Enter a language" maxLength={60} disabled={summaryTranslating} />}
                   {summaryTranslations[`${requestedTargetLanguage} · ${selectedSummaryTranslationModel?.name ?? ""}`] && <div className="summary-translated"><strong>{requestedTargetLanguage}</strong><MarkdownSummary text={summaryTranslations[`${requestedTargetLanguage} · ${selectedSummaryTranslationModel?.name ?? ""}`]} /></div>}
@@ -2035,6 +2290,15 @@ export default function App() {
                 </div>
               </details>
             )}
+
+            {(sourceMode === "system" || completed) && (completed || systemRecording || liveRecording || notesText || Boolean(audio && audioOwner === sourceMode)) && <details className="summary-panel notes-panel" open>
+              <summary className="summary-panel-heading"><div><p className="eyebrow">MARKDOWN · INCREMENTAL NOTES</p><h3>Meeting / class notes</h3></div>{notesMode && <span className="summary-status-pill started"><Loader2 className="spin" size={13} /> Notes active</span>}</summary>
+              <div className="summary-panel-content">
+                {!notesMode && <button className="summary-start-button" onClick={startMeetingNotes} disabled={!selectedTranslationModel}>Start notes</button>}
+                <p className="model-settings-hint">Notes model: {selectedTranslationModel?.name ?? translationModel} · Change in Settings</p>
+                {notesText ? <MarkdownSummary text={notesText} /> : <p className="summary-empty">Notes are appended and refined as transcript sections arrive. Works with recording, local files, and online media.</p>}
+              </div>
+            </details>}
 
             {completed && (
               <details className="translation-panel translation-fold" open>
@@ -2098,19 +2362,27 @@ export default function App() {
         {error && <div className="error-toast"><CircleAlert size={18} /><span>{error}</span><button onClick={() => setError("")}><X size={16} /></button></div>}
       </main>
 
-      <SettingsModal open={settingsOpen} keys={apiKeys} onClose={() => setSettingsOpen(false)} onChanged={refreshApiKeys} parallelRequests={parallelRequests} onParallelRequestsChange={setParallelRequests} technicalErrors={technicalErrors} onTechnicalErrorsChange={setTechnicalErrors} technicalDetails={technicalDetails} onTechnicalDetailsChange={setTechnicalDetails} headlessBrowser={headlessBrowser} onHeadlessBrowserChange={setHeadlessBrowser} translationModels={availableTranslationModels} summaryModel={translationModel} onSummaryModelChange={setTranslationModel} transcriptTranslationModel={transcriptTranslationModel} onTranscriptTranslationModelChange={setTranscriptTranslationModel} summaryTranslationModel={summaryTranslationModel} onSummaryTranslationModelChange={setSummaryTranslationModel} questionModel={questionModel} onQuestionModelChange={setQuestionModel} />
+      <SettingsModal open={settingsOpen} keys={apiKeys} adminKeys={adminApiKeys} onClose={() => setSettingsOpen(false)} onChanged={refreshSettingsKeys} parallelRequests={parallelRequests} onParallelRequestsChange={setParallelRequests} technicalErrors={technicalErrors} onTechnicalErrorsChange={setTechnicalErrors} technicalDetails={technicalDetails} onTechnicalDetailsChange={setTechnicalDetails} headlessBrowser={headlessBrowser} onHeadlessBrowserChange={setHeadlessBrowser} translationModels={availableTranslationModels} summaryModel={translationModel} onSummaryModelChange={setTranslationModel} transcriptTranslationModel={transcriptTranslationModel} onTranscriptTranslationModelChange={setTranscriptTranslationModel} summaryTranslationModel={summaryTranslationModel} onSummaryTranslationModelChange={setSummaryTranslationModel} questionModel={questionModel} onQuestionModelChange={setQuestionModel} />
       <LibraryModal
         open={libraryOpen}
         files={libraryFiles}
         transcripts={savedTranscripts}
-        deletionDisabled={busy || systemRecording || liveRecording || systemStopping || liveStopping}
+        deletionDisabled={transcriptionBusyBySlot.file || transcriptionBusyBySlot.online || systemRecording || liveRecording || systemStopping || liveStopping}
         onClose={() => setLibraryOpen(false)}
-        onOpenFile={(file) => { setLibraryOpen(false); switchSourceMode("file"); void inspectAudio(file.path).then((ready) => { if (ready) setTranscriptionContextPrompt(file.contextPrompt ?? ""); }); }}
-        onOpenTranscript={(item) => { setLibraryOpen(false); openSavedTranscript(item); }}
+        onOpenFile={(file) => {
+          if (isLocalTaskBusy()) { setError("Local file is busy with another task. Wait for it to finish before opening a Library item."); return; }
+          setLibraryOpen(false); switchSourceMode("file");
+          void inspectAudio(file.path).then((ready) => { if (ready) setTranscriptionContextPrompt(file.contextPrompt ?? ""); });
+        }}
+        onOpenTranscript={(item) => {
+          if (isLocalTaskBusy()) { setError("Local file is busy with another task. Wait for it to finish before opening a Library transcript."); return; }
+          setLibraryOpen(false); switchSourceMode("file"); openSavedTranscript(item);
+        }}
         onRevealPath={(path) => { void invoke("reveal_library_path", { path }).catch((cause) => setError(errorMessage(cause))); }}
         onDeleteFile={(file) => setPendingDelete({ kind: "media", id: file.path, name: file.name, isReference: file.isReference })}
         onDeleteTranscript={(item) => setPendingDelete({ kind: "transcript", id: item.id, name: item.name })}
       />
+      <UsageModal open={usageOpen} costs={projectCosts} loading={usageLoading} error={usageError} onRefresh={() => void refreshUsage()} onClose={() => setUsageOpen(false)} />
       <DownloadModal open={downloadOpen} versions={transcriptVersions} selectedLanguage={downloadLanguage} onLanguageChange={setDownloadLanguage} onClose={() => setDownloadOpen(false)} onConfirm={downloadTranscript} />
       <ConfirmationModal
         open={conversionOpen}

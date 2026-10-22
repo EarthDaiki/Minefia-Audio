@@ -35,6 +35,7 @@ pub struct ApiKeySummary {
     pub label: String,
     pub masked: String,
     pub is_selected: bool,
+    pub openai_key_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +43,8 @@ struct KeyMetadata {
     id: String,
     label: String,
     last_four: String,
+    #[serde(default)]
+    openai_key_id: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -51,7 +54,27 @@ struct Registry {
 }
 
 pub fn list(app: &AppHandle) -> Result<Vec<ApiKeySummary>, CredentialError> {
-    let registry = load_registry_with_migration(app)?;
+    let mut registry = load_registry_with_migration(app)?;
+    let original_len = registry.keys.len();
+    let mut available = Vec::with_capacity(original_len);
+    for key in registry.keys.drain(..) {
+        match key_entry(&key.id)?.get_password() {
+            Ok(_) => available.push(key),
+            Err(keyring::Error::NoEntry) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    registry.keys = available;
+    if registry.keys.len() != original_len {
+        if !registry
+            .selected_id
+            .as_ref()
+            .is_some_and(|id| registry.keys.iter().any(|key| &key.id == id))
+        {
+            registry.selected_id = registry.keys.first().map(|key| key.id.clone());
+        }
+        write_registry(app, &registry)?;
+    }
     Ok(registry
         .keys
         .iter()
@@ -60,11 +83,21 @@ pub fn list(app: &AppHandle) -> Result<Vec<ApiKeySummary>, CredentialError> {
             label: key.label.clone(),
             masked: format!("•••• {}", key.last_four),
             is_selected: registry.selected_id.as_deref() == Some(&key.id),
+            openai_key_id: key.openai_key_id.clone(),
         })
         .collect())
 }
 
 pub fn save(app: &AppHandle, label: &str, api_key: &str) -> Result<ApiKeySummary, CredentialError> {
+    save_with_openai_key_id(app, label, api_key, None)
+}
+
+pub fn save_with_openai_key_id(
+    app: &AppHandle,
+    label: &str,
+    api_key: &str,
+    openai_key_id: Option<&str>,
+) -> Result<ApiKeySummary, CredentialError> {
     let api_key = api_key.trim();
     let label = label.trim();
     if api_key.is_empty() {
@@ -88,6 +121,7 @@ pub fn save(app: &AppHandle, label: &str, api_key: &str) -> Result<ApiKeySummary
             .into_iter()
             .rev()
             .collect(),
+        openai_key_id: openai_key_id.map(str::to_owned),
     };
     registry.keys.push(metadata.clone());
     registry.selected_id = Some(id.clone());
@@ -101,7 +135,24 @@ pub fn save(app: &AppHandle, label: &str, api_key: &str) -> Result<ApiKeySummary
         label: metadata.label,
         masked: format!("•••• {}", metadata.last_four),
         is_selected: true,
+        openai_key_id: metadata.openai_key_id,
     })
+}
+
+pub fn has_openai_key_id(app: &AppHandle, openai_key_id: &str) -> Result<bool, CredentialError> {
+    let registry = load_registry_with_migration(app)?;
+    for key in registry
+        .keys
+        .iter()
+        .filter(|key| key.openai_key_id.as_deref() == Some(openai_key_id))
+    {
+        match key_entry(&key.id)?.get_password() {
+            Ok(_) => return Ok(true),
+            Err(keyring::Error::NoEntry) => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(false)
 }
 
 pub fn select(app: &AppHandle, id: &str) -> Result<(), CredentialError> {
@@ -189,6 +240,7 @@ fn load_registry_with_migration(app: &AppHandle) -> Result<Registry, CredentialE
             .into_iter()
             .rev()
             .collect(),
+        openai_key_id: None,
     });
     registry.selected_id = Some(id);
     write_registry(app, &registry)?;

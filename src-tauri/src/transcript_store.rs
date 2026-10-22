@@ -303,6 +303,31 @@ pub async fn save_summary(
         .map_err(|error| error.to_string())
 }
 
+pub async fn save_notes(
+    app: &tauri::AppHandle,
+    id: &str,
+    name: &str,
+    text: &str,
+) -> Result<(), String> {
+    let id = Uuid::parse_str(id).map_err(|_| "Invalid transcript session identifier.")?;
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    let root = transcript_root(app)?;
+    let session_id = id.to_string();
+    let directory = match existing_session_dir(app, &session_id).await? {
+        Some(path) => path,
+        None => new_session_dir(&root, &session_id, name).await?,
+    };
+    let temp = directory.join("notes.md.tmp");
+    tokio::fs::write(&temp, text.trim())
+        .await
+        .map_err(|error| error.to_string())?;
+    tokio::fs::rename(temp, directory.join("notes.md"))
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// Stores a translation beside the transcript it was translated from.
 pub async fn save_translation(
     app: &tauri::AppHandle,
@@ -356,11 +381,12 @@ pub async fn save_summary_translation(
         .map_err(|error| error.to_string())?;
     let stem = safe_audio_stem(source_name.trim_end_matches(".txt"));
     let language = safe_file_stem(language);
-    let file_name = format!(
-        "{stem}__{language}_{}.txt",
-        crate::storage::timestamp_millis()
-    );
-    tokio::fs::write(directory.join(file_name), text.as_bytes())
+    let file_name = format!("{stem}__{language}_live.txt");
+    let temporary = directory.join(format!(".{file_name}.tmp"));
+    tokio::fs::write(&temporary, text.as_bytes())
+        .await
+        .map_err(|error| error.to_string())?;
+    tokio::fs::rename(temporary, directory.join(file_name))
         .await
         .map_err(|error| error.to_string())
 }
@@ -688,6 +714,18 @@ pub async fn list(app: &tauri::AppHandle) -> Result<Vec<SavedTranscript>, String
                 });
             }
         }
+        if let Ok(notes) = tokio::fs::read_to_string(session.join("notes.md")).await {
+            if !notes.trim().is_empty() {
+                result.push(SavedTranscript {
+                    id: format!("notes:{id}"),
+                    name: format!("{name} · Notes"),
+                    date: date.clone(),
+                    text: notes,
+                    kind: "notes".into(),
+                    path: session.join("notes.md").to_string_lossy().into_owned(),
+                });
+            }
+        }
         let summary_translations_dir = session.join("summary-translations");
         if let Ok(mut files) = tokio::fs::read_dir(&summary_translations_dir).await {
             while let Some(file) = files
@@ -943,7 +981,11 @@ pub async fn remove(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
         return Ok(());
     }
     let is_summary = id.starts_with("summary:");
-    let raw_id = id.strip_prefix("summary:").unwrap_or(id);
+    let is_notes = id.starts_with("notes:");
+    let raw_id = id
+        .strip_prefix("summary:")
+        .or_else(|| id.strip_prefix("notes:"))
+        .unwrap_or(id);
     let id = Uuid::parse_str(raw_id).map_err(|_| "Invalid transcript session identifier.")?;
     let Some(directory) = existing_session_dir(app, &id.to_string()).await? else {
         return Ok(());
@@ -966,6 +1008,12 @@ pub async fn remove(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
     }
     if is_summary {
         match tokio::fs::remove_file(canonical_directory.join("summary.md")).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    } else if is_notes {
+        match tokio::fs::remove_file(canonical_directory.join("notes.md")).await {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.to_string()),

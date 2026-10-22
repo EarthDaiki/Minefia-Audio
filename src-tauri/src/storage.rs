@@ -38,6 +38,10 @@ pub fn utc_date_now() -> String {
     civil_date_from_days(days)
 }
 
+pub fn date_from_epoch_seconds(seconds: u64) -> String {
+    civil_date_from_days((seconds / 86_400) as i64)
+}
+
 /// A filesystem-safe 24-hour UTC time (hour-minute-second) for transcript session folders.
 pub fn utc_time_now() -> String {
     let now = std::time::SystemTime::now()

@@ -5,6 +5,7 @@ use reqwest::{multipart, Client};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -18,46 +19,90 @@ use tokio::time::sleep;
 
 #[derive(Default)]
 pub struct TranscriptionManager {
-    active: Mutex<Option<Arc<AtomicBool>>>,
+    active: Mutex<HashMap<String, ActiveTranscription>>,
+}
+
+struct ActiveTranscription {
+    task_id: String,
+    cancel: Arc<AtomicBool>,
+    request_active: bool,
 }
 
 impl TranscriptionManager {
-    pub fn begin(&self) -> Result<Arc<AtomicBool>, TranscriptionError> {
+    pub fn begin(
+        &self,
+        task_slot: &str,
+        task_id: &str,
+    ) -> Result<Arc<AtomicBool>, TranscriptionError> {
+        if !matches!(task_slot, "file" | "online") || task_id.is_empty() {
+            return Err(TranscriptionError::Job(
+                "The transcription task identity is invalid.".into(),
+            ));
+        }
         let mut active = self
             .active
             .lock()
             .map_err(|_| TranscriptionError::Job("Transcription state is unavailable.".into()))?;
-        if active.is_some() {
-            return Err(TranscriptionError::Job(
-                "A transcription is already running.".into(),
-            ));
+        if let Some(current) = active.get(task_slot) {
+            if current.task_id == task_id {
+                if current.request_active {
+                    return Err(TranscriptionError::Job(format!(
+                        "A {task_slot} request is already active for this task."
+                    )));
+                }
+                let cancel = current.cancel.clone();
+                active
+                    .get_mut(task_slot)
+                    .expect("entry checked above")
+                    .request_active = true;
+                return Ok(cancel);
+            }
+            return Err(TranscriptionError::Job(format!(
+                "A {task_slot} transcription is already running."
+            )));
         }
         let cancel = Arc::new(AtomicBool::new(false));
-        *active = Some(cancel.clone());
+        active.insert(
+            task_slot.into(),
+            ActiveTranscription {
+                task_id: task_id.into(),
+                cancel: cancel.clone(),
+                request_active: true,
+            },
+        );
         Ok(cancel)
     }
 
-    pub fn cancel(&self) -> Result<(), TranscriptionError> {
+    pub fn cancel(&self, task_slot: &str, task_id: &str) -> Result<(), TranscriptionError> {
         let active = self
             .active
             .lock()
             .map_err(|_| TranscriptionError::Job("Transcription state is unavailable.".into()))?;
-        let Some(cancel) = active.as_ref() else {
-            return Err(TranscriptionError::Job(
-                "No transcription is running.".into(),
-            ));
+        let Some(task) = active.get(task_slot).filter(|task| task.task_id == task_id) else {
+            return Err(TranscriptionError::Job(format!(
+                "No matching {task_slot} transcription is running."
+            )));
         };
-        cancel.store(true, Ordering::Release);
+        task.cancel.store(true, Ordering::Release);
         Ok(())
     }
 
-    pub fn finish(&self, token: &Arc<AtomicBool>) {
+    pub fn finish(
+        &self,
+        task_slot: &str,
+        task_id: &str,
+        token: &Arc<AtomicBool>,
+        task_complete: bool,
+    ) {
         if let Ok(mut active) = self.active.lock() {
-            if active
-                .as_ref()
-                .is_some_and(|current| Arc::ptr_eq(current, token))
-            {
-                *active = None;
+            if active.get(task_slot).is_some_and(|current| {
+                current.task_id == task_id && Arc::ptr_eq(&current.cancel, token)
+            }) {
+                if task_complete {
+                    active.remove(task_slot);
+                } else if let Some(current) = active.get_mut(task_slot) {
+                    current.request_active = false;
+                }
             }
         }
     }
@@ -178,6 +223,8 @@ pub enum TranscriptionError {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProgressEvent {
+    task_id: String,
+    task_slot: String,
     kind: &'static str,
     message: Option<String>,
     delta: Option<String>,
@@ -207,6 +254,8 @@ pub struct AvailableModels {
 
 struct TranscriptionContext<'a> {
     app: &'a tauri::AppHandle,
+    task_id: &'a str,
+    task_slot: &'a str,
     client: &'a Client,
     api_key: &'a str,
     model: &'a str,
@@ -253,6 +302,8 @@ pub async fn transcribe(
     model: &str,
     parallel_requests: usize,
     job_id: &str,
+    task_id: &str,
+    task_slot: &str,
     context_prompt: Option<&str>,
     cancel: &AtomicBool,
 ) -> Result<String, TranscriptionError> {
@@ -291,6 +342,8 @@ pub async fn transcribe(
         emit(
             app,
             ProgressEvent::message("preparing", "Preparing audio and finding safe split points"),
+            task_id,
+            task_slot,
         )?;
         let prepared_dir = job_dir.join("prepared");
         tokio::fs::create_dir_all(&prepared_dir).await?;
@@ -344,6 +397,8 @@ pub async fn transcribe(
         .build()?;
     let request_context = TranscriptionContext {
         app,
+        task_id,
+        task_slot,
         client: &client,
         api_key,
         model,
@@ -361,7 +416,12 @@ pub async fn transcribe(
         for (index, path) in batch {
             let index = *index;
             let chunk = index + 1;
-            emit(app, ProgressEvent::chunk("uploading", chunk, total))?;
+            emit(
+                app,
+                ProgressEvent::chunk("uploading", chunk, total),
+                task_id,
+                task_slot,
+            )?;
             let prefix = transcript_prefix(&state.completed_parts, index);
             let previous_context = (!prefix.is_empty()).then(|| tail_chars(&prefix, 900));
             let prompt =
@@ -414,6 +474,8 @@ pub async fn transcribe(
     emit(
         app,
         ProgressEvent::message("done", "Transcription complete"),
+        task_id,
+        task_slot,
     )?;
     // A completed transcript is persisted separately. The job directory is only
     // recovery state for interrupted work, so it can be removed after completion.
@@ -431,6 +493,8 @@ pub async fn resume_job(
     app: &tauri::AppHandle,
     api_key: &str,
     job_id: &str,
+    task_id: &str,
+    task_slot: &str,
     cancel: &AtomicBool,
 ) -> Result<String, TranscriptionError> {
     let id = uuid::Uuid::parse_str(job_id)
@@ -455,6 +519,8 @@ pub async fn resume_job(
         &state.model,
         state.parallel_requests,
         &state.id,
+        task_id,
+        task_slot,
         state.context_prompt.as_deref(),
         cancel,
     )
@@ -570,7 +636,12 @@ pub async fn transcribe_recording_part(
             .mime_str(mime_for_path(path))?;
         let diarize = is_diarization_model(&model);
         let actual_prompt = if diarize { None } else { prompt };
-        emit(app, ProgressEvent::prompt(chunk, None, actual_prompt))?;
+        emit(
+            app,
+            ProgressEvent::prompt(chunk, None, actual_prompt),
+            "audio-capture",
+            "system",
+        )?;
         let mut form = multipart::Form::new()
             .text("model", model.to_owned())
             .text(
@@ -647,6 +718,8 @@ async fn transcribe_part_with_retry(
                 emit(
                     context.app,
                     ProgressEvent::chunk_result(chunk, context.total, &text),
+                    context.task_id,
+                    context.task_slot,
                 )?;
                 return Ok(text);
             }
@@ -662,6 +735,8 @@ async fn transcribe_part_with_retry(
                             retry + 1
                         ),
                     ),
+                    context.task_id,
+                    context.task_slot,
                 )?;
                 tokio::select! {
                     _ = sleep(Duration::from_secs(delay)) => {},
@@ -695,6 +770,8 @@ async fn transcribe_part_once(
     emit(
         context.app,
         ProgressEvent::prompt(chunk, Some(context.total), actual_prompt),
+        context.task_id,
+        context.task_slot,
     )?;
     let mut form = multipart::Form::new()
         .text("model", context.model.to_owned())
@@ -761,6 +838,8 @@ async fn transcribe_part_once(
                     emit(
                         context.app,
                         ProgressEvent::delta(delta, chunk, context.total),
+                        context.task_id,
+                        context.task_slot,
                     )?;
                 }
             }
@@ -786,6 +865,8 @@ async fn transcribe_part_once(
         emit(
             context.app,
             ProgressEvent::delta(&result, chunk, context.total),
+            context.task_id,
+            context.task_slot,
         )?;
     }
     Ok(result)
@@ -858,7 +939,14 @@ fn api_error_message(body: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn emit(app: &tauri::AppHandle, event: ProgressEvent) -> Result<(), TranscriptionError> {
+fn emit(
+    app: &tauri::AppHandle,
+    mut event: ProgressEvent,
+    task_id: &str,
+    task_slot: &str,
+) -> Result<(), TranscriptionError> {
+    event.task_id = task_id.to_owned();
+    event.task_slot = task_slot.to_owned();
     app.emit("transcription-progress", event)
         .map_err(|error| TranscriptionError::Event(error.to_string()))
 }
@@ -891,6 +979,8 @@ fn mime_for_path(path: &Path) -> &'static str {
 impl ProgressEvent {
     fn message(kind: &'static str, message: &str) -> Self {
         Self {
+            task_id: String::new(),
+            task_slot: String::new(),
             kind,
             message: Some(message.into()),
             delta: None,
@@ -903,6 +993,8 @@ impl ProgressEvent {
 
     fn chunk(kind: &'static str, chunk: usize, total_chunks: usize) -> Self {
         Self {
+            task_id: String::new(),
+            task_slot: String::new(),
             kind,
             message: None,
             delta: None,
@@ -915,6 +1007,8 @@ impl ProgressEvent {
 
     fn delta(delta: &str, chunk: usize, total_chunks: usize) -> Self {
         Self {
+            task_id: String::new(),
+            task_slot: String::new(),
             kind: "delta",
             message: None,
             delta: Some(delta.into()),
@@ -927,6 +1021,8 @@ impl ProgressEvent {
 
     fn retry(chunk: usize, total_chunks: usize, message: &str) -> Self {
         Self {
+            task_id: String::new(),
+            task_slot: String::new(),
             kind: "retrying",
             message: Some(message.into()),
             delta: None,
@@ -939,6 +1035,8 @@ impl ProgressEvent {
 
     fn chunk_result(chunk: usize, total_chunks: usize, text: &str) -> Self {
         Self {
+            task_id: String::new(),
+            task_slot: String::new(),
             kind: "chunk_done",
             message: None,
             delta: None,
@@ -951,6 +1049,8 @@ impl ProgressEvent {
 
     fn prompt(chunk: usize, total_chunks: Option<usize>, prompt: Option<&str>) -> Self {
         Self {
+            task_id: String::new(),
+            task_slot: String::new(),
             kind: "prompt",
             message: None,
             delta: None,
@@ -966,8 +1066,30 @@ impl ProgressEvent {
 mod tests {
     use super::{
         compose_prompt, filter_supported_models, format_diarized_segments, retry_delay_seconds,
-        ApiModel,
+        ApiModel, TranscriptionManager,
     };
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn file_and_online_transcriptions_have_independent_cancellation_slots() {
+        let manager = TranscriptionManager::default();
+        let file = manager.begin("file", "file-task").unwrap();
+        let online = manager.begin("online", "online-task").unwrap();
+
+        assert!(manager.begin("file", "duplicate-file-task").is_err());
+        assert!(manager.begin("file", "file-task").is_err());
+        assert!(manager.cancel("file", "online-task").is_err());
+        manager.cancel("online", "online-task").unwrap();
+        assert!(!file.load(Ordering::Acquire));
+        assert!(online.load(Ordering::Acquire));
+
+        manager.finish("file", "file-task", &file, false);
+        let next_file_request = manager.begin("file", "file-task").unwrap();
+        assert!(std::sync::Arc::ptr_eq(&file, &next_file_request));
+        manager.finish("file", "file-task", &file, true);
+        manager.finish("online", "online-task", &online, true);
+        assert!(manager.begin("file", "next-file-task").is_ok());
+    }
 
     #[test]
     fn filters_and_orders_available_transcription_models() {

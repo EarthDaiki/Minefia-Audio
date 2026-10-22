@@ -1,3 +1,5 @@
+mod admin_credentials;
+mod app_project;
 mod audio;
 mod browser_media;
 mod credentials;
@@ -13,6 +15,7 @@ mod technical_log;
 mod transcript_store;
 mod transcription;
 mod translation;
+mod usage;
 
 use audio::AudioInfo;
 use serde::Deserialize;
@@ -29,6 +32,9 @@ struct TranscribeRequest {
     model: String,
     parallel_requests: usize,
     job_id: String,
+    task_id: String,
+    task_slot: String,
+    task_complete: bool,
     #[serde(default)]
     context_prompt: Option<String>,
 }
@@ -200,6 +206,108 @@ async fn save_transcript_summary(
     transcript_store::save_summary(&app, &session_id, &name, &text)
         .await
         .map_err(errors::classify)
+}
+
+#[tauri::command]
+async fn save_transcript_notes(
+    app: tauri::AppHandle,
+    session_id: String,
+    name: String,
+    text: String,
+) -> Result<(), errors::AppError> {
+    transcript_store::save_notes(&app, &session_id, &name, &text)
+        .await
+        .map_err(errors::classify)
+}
+
+#[tauri::command]
+async fn fetch_project_costs(
+    app: tauri::AppHandle,
+) -> Result<usage::ProjectCosts, errors::AppError> {
+    if !app_project::usage_ready(&app).map_err(errors::classify)? {
+        return Err(errors::classify(
+            "Usage is available after Minefia Audio is linked to a Project Service Account key.",
+        ));
+    }
+    let api_key = admin_credentials::load_selected(&app).map_err(errors::classify)?;
+    let project = app_project::get(&app).map_err(errors::classify)?;
+    let project_id = project
+        .project_id
+        .ok_or_else(|| errors::classify("No Minefia Audio Project is selected."))?;
+    usage::fetch(&api_key, &project_id)
+        .await
+        .map_err(errors::classify)
+}
+
+#[tauri::command]
+fn list_admin_api_keys(
+    app: tauri::AppHandle,
+) -> Result<Vec<admin_credentials::AdminKeySummary>, errors::AppError> {
+    admin_credentials::list(&app).map_err(errors::classify)
+}
+
+#[tauri::command]
+async fn save_admin_api_key(
+    app: tauri::AppHandle,
+    label: String,
+    api_key: String,
+) -> Result<admin_credentials::AdminKeySummary, errors::AppError> {
+    // Verify the Admin credential with the lightweight admin-key listing route.
+    usage::validate_admin_key(&api_key)
+        .await
+        .map_err(errors::classify)?;
+    admin_credentials::save(&app, &label, &api_key).map_err(errors::classify)
+}
+
+#[tauri::command]
+fn get_minefia_project(app: tauri::AppHandle) -> Result<app_project::AppProject, errors::AppError> {
+    app_project::get(&app).map_err(errors::classify)
+}
+
+#[tauri::command]
+async fn list_openai_projects(
+    app: tauri::AppHandle,
+) -> Result<Vec<app_project::ProjectSummary>, errors::AppError> {
+    let admin_key = admin_credentials::load_selected(&app).map_err(errors::classify)?;
+    app_project::list_projects(&admin_key)
+        .await
+        .map_err(errors::classify)
+}
+
+#[tauri::command]
+fn select_minefia_project(
+    app: tauri::AppHandle,
+    project_id: String,
+    project_name: String,
+) -> Result<app_project::AppProject, errors::AppError> {
+    app_project::select_existing_project(&app, &project_id, &project_name).map_err(errors::classify)
+}
+
+#[tauri::command]
+fn minefia_usage_ready(app: tauri::AppHandle) -> Result<bool, errors::AppError> {
+    app_project::usage_ready(&app).map_err(errors::classify)
+}
+
+#[tauri::command]
+async fn create_minefia_project_key(
+    app: tauri::AppHandle,
+    project_name: String,
+    service_account_name: String,
+) -> Result<app_project::CreatedProjectKey, errors::AppError> {
+    let admin_key = admin_credentials::load_selected(&app).map_err(errors::classify)?;
+    app_project::create_project_and_key(&app, &admin_key, &project_name, &service_account_name)
+        .await
+        .map_err(errors::classify)
+}
+
+#[tauri::command]
+fn select_admin_api_key(app: tauri::AppHandle, id: String) -> Result<(), errors::AppError> {
+    admin_credentials::select(&app, &id).map_err(errors::classify)
+}
+
+#[tauri::command]
+fn delete_admin_api_key(app: tauri::AppHandle, id: String) -> Result<(), errors::AppError> {
+    admin_credentials::remove(&app, &id).map_err(errors::classify)
 }
 
 #[tauri::command]
@@ -413,7 +521,9 @@ async fn transcribe_audio(
     request: TranscribeRequest,
 ) -> Result<String, errors::AppError> {
     let api_key = credentials::load_selected(&app).map_err(errors::classify)?;
-    let cancel = manager.begin().map_err(errors::classify)?;
+    let cancel = manager
+        .begin(&request.task_slot, &request.task_id)
+        .map_err(errors::classify)?;
     let result = transcription::transcribe(
         &app,
         Path::new(&request.path),
@@ -424,11 +534,18 @@ async fn transcribe_audio(
         &request.model,
         request.parallel_requests,
         &request.job_id,
+        &request.task_id,
+        &request.task_slot,
         request.context_prompt.as_deref(),
         &cancel,
     )
     .await;
-    manager.finish(&cancel);
+    manager.finish(
+        &request.task_slot,
+        &request.task_id,
+        &cancel,
+        request.task_complete || result.is_err(),
+    );
     result.map_err(errors::classify)
 }
 
@@ -446,19 +563,28 @@ async fn resume_transcription(
     app: tauri::AppHandle,
     manager: tauri::State<'_, transcription::TranscriptionManager>,
     job_id: String,
+    task_id: String,
+    task_slot: String,
 ) -> Result<String, errors::AppError> {
     let api_key = credentials::load_selected(&app).map_err(errors::classify)?;
-    let cancel = manager.begin().map_err(errors::classify)?;
-    let result = transcription::resume_job(&app, &api_key, &job_id, &cancel).await;
-    manager.finish(&cancel);
+    let cancel = manager
+        .begin(&task_slot, &task_id)
+        .map_err(errors::classify)?;
+    let result =
+        transcription::resume_job(&app, &api_key, &job_id, &task_id, &task_slot, &cancel).await;
+    manager.finish(&task_slot, &task_id, &cancel, true);
     result.map_err(errors::classify)
 }
 
 #[tauri::command]
 fn cancel_transcription(
     manager: tauri::State<'_, transcription::TranscriptionManager>,
+    task_id: String,
+    task_slot: String,
 ) -> Result<(), errors::AppError> {
-    manager.cancel().map_err(errors::classify)
+    manager
+        .cancel(&task_slot, &task_id)
+        .map_err(errors::classify)
 }
 
 #[tauri::command]
@@ -542,6 +668,17 @@ pub fn run() {
             append_saved_transcript,
             replace_saved_transcript_chunk,
             save_transcript_summary,
+            save_transcript_notes,
+            fetch_project_costs,
+            list_admin_api_keys,
+            save_admin_api_key,
+            get_minefia_project,
+            list_openai_projects,
+            select_minefia_project,
+            minefia_usage_ready,
+            create_minefia_project_key,
+            select_admin_api_key,
+            delete_admin_api_key,
             save_transcript_translation,
             save_summary_translation,
             snapshot_saved_transcript,

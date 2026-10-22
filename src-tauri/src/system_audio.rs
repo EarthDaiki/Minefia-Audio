@@ -147,15 +147,36 @@ pub fn start(
     std::thread::Builder::new()
         .name("minefia-system-audio".into())
         .spawn(move || {
-            if let Err(message) = capture_source(
+            let result = capture_source(
                 capture_stop,
                 batch_tx,
                 &source,
                 input_device.as_deref(),
                 &capture_app,
-            ) {
+            );
+            if let Err(message) = result {
                 emit_error(&capture_app, message);
             }
+            // The remaining finalized chunks still drain through the transcription queue.
+            let _ = capture_app.emit(
+                "system-audio-progress",
+                SystemAudioEvent {
+                    kind: "capture_stopped",
+                    elapsed_seconds: 0.0,
+                    chunk_seconds: 0.0,
+                    completed_chunks: 0,
+                    queued_chunks: 0,
+                    active_requests: 0,
+                    waiting_for_silence: false,
+                    force_split_in_seconds: 0.0,
+                    estimated_cost: 0.0,
+                    chunk: None,
+                    text: None,
+                    message: Some("Audio input stopped; finishing captured parts.".into()),
+                    code: None,
+                    input_level: None,
+                },
+            );
         })
         .map_err(|error| error.to_string())?;
 
@@ -891,7 +912,9 @@ async fn run_transcription_queue(
                             elapsed_seconds: 0.0,
                             chunk_seconds: 0.0,
                             completed_chunks: next_result,
-                            queued_chunks: pending,
+                            queued_chunks: pending.saturating_sub(
+                                parallel_requests.saturating_sub(semaphore.available_permits()),
+                            ) + chunks.len(),
                             active_requests: parallel_requests.saturating_sub(semaphore.available_permits()),
                             waiting_for_silence: false,
                             force_split_in_seconds: 0.0,
@@ -911,7 +934,7 @@ async fn run_transcription_queue(
                     elapsed_seconds: 0.0,
                     chunk_seconds: 0.0,
                     completed_chunks: next_result.saturating_sub(1),
-                    queued_chunks: pending.saturating_sub(active_requests),
+                    queued_chunks: pending.saturating_sub(active_requests) + chunks.len(),
                     active_requests,
                     waiting_for_silence: false,
                     force_split_in_seconds: 0.0,
@@ -930,7 +953,7 @@ async fn run_transcription_queue(
                     elapsed_seconds: 0.0,
                     chunk_seconds: 0.0,
                     completed_chunks: next_result.saturating_sub(1),
-                    queued_chunks: pending.saturating_sub(active_requests),
+                    queued_chunks: pending.saturating_sub(active_requests) + chunks.len(),
                     active_requests,
                     waiting_for_silence: false,
                     force_split_in_seconds: 0.0,

@@ -28,13 +28,14 @@ export function LibraryModal({
   onDeleteFile,
   onDeleteTranscript,
 }: Props) {
-  const [tab, setTab] = useState<"media" | "transcripts" | "enhanced" | "summaries" | "translations" | "summaryTranslations">("media");
+  const [tab, setTab] = useState<"media" | "transcripts" | "enhanced" | "summaries" | "notes" | "translations" | "summaryTranslations">("media");
   const [query, setQuery] = useState("");
   const filteredFiles = useMemo(() => files.filter((file) => file.name.toLowerCase().includes(query.toLowerCase())), [files, query]);
   const filteredTranscripts = useMemo(() => transcripts.filter((item) => {
     const matchesQuery = item.name.toLowerCase().includes(query.toLowerCase());
     if (!matchesQuery) return false;
     if (tab === "summaries") return item.kind === "summary";
+    if (tab === "notes") return item.kind === "notes";
     if (tab === "translations") return item.kind === "translation";
     if (tab === "summaryTranslations") return item.kind === "summary_translation";
     if (tab === "enhanced") return item.kind === "enhanced";
@@ -63,6 +64,7 @@ export function LibraryModal({
         <button className={tab === "transcripts" ? "selected" : ""} onClick={() => setTab("transcripts")}><FileText size={14} />Transcripts <small>{transcripts.filter((item) => item.kind === "transcript").length}</small></button>
         <button className={tab === "enhanced" ? "selected" : ""} onClick={() => setTab("enhanced")}><Sparkles size={14} />Enhanced <small>{transcripts.filter((item) => item.kind === "enhanced").length}</small></button>
         <button className={tab === "summaries" ? "selected" : ""} onClick={() => setTab("summaries")}><FileText size={14} />Summaries <small>{transcripts.filter((item) => item.kind === "summary").length}</small></button>
+        <button className={tab === "notes" ? "selected" : ""} onClick={() => setTab("notes")}><FileText size={14} />Notes <small>{transcripts.filter((item) => item.kind === "notes").length}</small></button>
         <button className={tab === "translations" ? "selected" : ""} onClick={() => setTab("translations")}><FileText size={14} />Transcript translations <small>{transcripts.filter((item) => item.kind === "translation").length}</small></button>
         <button className={tab === "summaryTranslations" ? "selected" : ""} onClick={() => setTab("summaryTranslations")}><FileText size={14} />Summary translations <small>{transcripts.filter((item) => item.kind === "summary_translation").length}</small></button>
       </div>
