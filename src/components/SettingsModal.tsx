@@ -3,7 +3,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { Check, Eye, EyeOff, Loader2, Plus, Settings, Trash2, X, FolderPlus, List } from "lucide-react";
 import type { AdminApiKeySummary, ApiKeySummary, CreatedProjectKey, MinefiaProject, OpenAIProjectSummary, TranslationModel } from "../types";
 import { errorMessage } from "../lib/errors";
-import { rememberOpenAIKeyId } from "../lib/keyMetadata";
 
 type Props = {
   open: boolean;
@@ -13,6 +12,12 @@ type Props = {
   onChanged: () => Promise<void>;
   parallelRequests: number;
   onParallelRequestsChange: (value: number) => void;
+  captureQuality: "low" | "standard" | "high" | "best";
+  onCaptureQualityChange: (value: "low" | "standard" | "high" | "best") => void;
+  availableCaptureQualities: Array<"low" | "standard" | "high" | "best">;
+  captureQualityRestrictionNote: string;
+  compactEnabled: boolean;
+  onCompactEnabledChange: (value: boolean) => void;
   technicalErrors: boolean;
   onTechnicalErrorsChange: (value: boolean) => void;
   technicalDetails: boolean;
@@ -30,8 +35,8 @@ type Props = {
   onQuestionModelChange: (value: string) => void;
 };
 
-export function SettingsModal({ open, keys, adminKeys, onClose, onChanged, parallelRequests, onParallelRequestsChange, technicalErrors, onTechnicalErrorsChange, technicalDetails, onTechnicalDetailsChange, headlessBrowser, onHeadlessBrowserChange, translationModels, summaryModel, onSummaryModelChange, transcriptTranslationModel, onTranscriptTranslationModelChange, summaryTranslationModel, onSummaryTranslationModelChange, questionModel, onQuestionModelChange }: Props) {
-  const [tab, setTab] = useState<"keys" | "models" | "general">("keys");
+export function SettingsModal({ open, keys, adminKeys, onClose, onChanged, parallelRequests, onParallelRequestsChange, captureQuality, onCaptureQualityChange, availableCaptureQualities, captureQualityRestrictionNote, compactEnabled, onCompactEnabledChange, technicalErrors, onTechnicalErrorsChange, technicalDetails, onTechnicalDetailsChange, headlessBrowser, onHeadlessBrowserChange, translationModels, summaryModel, onSummaryModelChange, transcriptTranslationModel, onTranscriptTranslationModelChange, summaryTranslationModel, onSummaryTranslationModelChange, questionModel, onQuestionModelChange }: Props) {
+  const [tab, setTab] = useState<"keys" | "projects" | "models" | "general">("keys");
   const [label, setLabel] = useState("");
   const [key, setKey] = useState("");
   const [adminLabel, setAdminLabel] = useState("");
@@ -44,7 +49,7 @@ export function SettingsModal({ open, keys, adminKeys, onClose, onChanged, paral
   const [adminError, setAdminError] = useState("");
   const [projectValidationVisible, setProjectValidationVisible] = useState(false);
   const [adminValidationVisible, setAdminValidationVisible] = useState(false);
-  const [appProject, setAppProject] = useState<MinefiaProject>({ projectId: null, projectName: null, createdByApp: false, serviceAccountId: null, serviceAccountName: null, apiKeyId: null });
+  const [appProjects, setAppProjects] = useState<MinefiaProject[]>([]);
   const [appProjectName, setAppProjectName] = useState("Minefia Audio");
   const [serviceAccountName, setServiceAccountName] = useState("");
   const [creatingAppProject, setCreatingAppProject] = useState(false);
@@ -58,7 +63,7 @@ export function SettingsModal({ open, keys, adminKeys, onClose, onChanged, paral
       setLabel(""); setKey(""); setAdminLabel(""); setAdminKey("");
       setError(""); setAdminError(""); setShow(false); setShowAdmin(false);
       setProjectValidationVisible(false); setAdminValidationVisible(false);
-      void invoke<MinefiaProject>("get_minefia_project").then(setAppProject).catch(() => setAppProject({ projectId: null, projectName: null, createdByApp: false, serviceAccountId: null, serviceAccountName: null, apiKeyId: null }));
+      void invoke<MinefiaProject[]>("get_minefia_projects").then(setAppProjects).catch(() => setAppProjects([]));
     }
   }, [open]);
 
@@ -106,16 +111,18 @@ export function SettingsModal({ open, keys, adminKeys, onClose, onChanged, paral
 
   async function createAppProject() {
     if (!serviceAccountName.trim()) return;
-    if (!appProject.projectId && projectMode === "create" && !appProjectName.trim()) return;
-    if (!appProject.projectId && projectMode === "select" && !selectedOpenAiProject) return;
+    if (projectMode === "create" && !appProjectName.trim()) return;
+    if (projectMode === "select" && !selectedOpenAiProject) return;
     setCreatingAppProject(true); setAdminError("");
     try {
-      if (!appProject.projectId && projectMode === "select" && selectedOpenAiProject) {
-        await invoke("select_minefia_project", { projectId: selectedOpenAiProject.id, projectName: selectedOpenAiProject.name });
-      }
-      const result = await invoke<CreatedProjectKey>("create_minefia_project_key", { projectName: appProjectName.trim(), serviceAccountName: serviceAccountName.trim() });
-      rememberOpenAIKeyId(result.key.openaiKeyId);
-      setAppProject(result.project);
+      await invoke<CreatedProjectKey>("create_minefia_project_key", {
+        existingProjectId: projectMode === "select" ? selectedOpenAiProject?.id ?? null : null,
+        projectName: projectMode === "select" && selectedOpenAiProject ? selectedOpenAiProject.name : appProjectName.trim(),
+        serviceAccountName: serviceAccountName.trim(),
+      });
+      setServiceAccountName("");
+      setSelectedOpenAiProject(null);
+      setAppProjects(await invoke<MinefiaProject[]>("get_minefia_projects"));
       await onChanged();
     } catch (cause) { setAdminError(errorMessage(cause)); }
     finally { setCreatingAppProject(false); }
@@ -162,6 +169,7 @@ export function SettingsModal({ open, keys, adminKeys, onClose, onChanged, paral
         </header>
         <nav className="settings-tabs" aria-label="Settings sections">
           <button className={tab === "keys" ? "selected" : ""} onClick={() => setTab("keys")}>API keys</button>
+          {adminKeys.length > 0 && <button className={tab === "projects" ? "selected" : ""} onClick={() => setTab("projects")}>Projects</button>}
           <button className={tab === "models" ? "selected" : ""} onClick={() => setTab("models")}>Models</button>
           <button className={tab === "general" ? "selected" : ""} onClick={() => setTab("general")}>General</button>
         </nav>
@@ -188,13 +196,14 @@ export function SettingsModal({ open, keys, adminKeys, onClose, onChanged, paral
                 {keys.map((item) => <div className={`saved-key ${item.isSelected ? "selected" : ""}`} key={item.id}>
                   <button className="key-select" onClick={() => void selectKey(item.id)}>
                     <span className="radio-mark">{item.isSelected && <Check size={12} />}</span>
-                    <span><strong>{item.label}</strong><small>{item.masked}</small></span>
+                  <span><strong>{item.label}</strong><small>{item.masked} · {item.openaiKeyId ? "Service Account key" : "Independent Project key"}</small></span>
                     {item.isSelected && <em>Default for app</em>}
                   </button>
                   <button className="delete-key" onClick={() => void deleteKey(item.id)} aria-label={`Delete ${item.label}`}><Trash2 size={15} /></button>
                 </div>)}
               </div>
               <h3 className="settings-subheading">Add Project API key</h3>
+              <p className="validation-note project-key-recommendation"><strong>Recommended:</strong> create a dedicated Project for Minefia Audio so this app’s API activity and usage stay separate. If you already have one, add a key from that Project here.</p>
               <label className="field-label" htmlFor="key-label">Keychain item name</label>
               <input className="text-field" id="key-label" value={label} onChange={(event) => { setLabel(event.target.value); setError(""); }} placeholder="Personal, Work, Client…" />
               <label className="field-label second-label" htmlFor="api-key">Project API key</label>
@@ -231,40 +240,59 @@ export function SettingsModal({ open, keys, adminKeys, onClose, onChanged, paral
               <p className="validation-note">Checked with <strong>GET /v1/organization/admin_api_keys?limit=1</strong> before saving. A failed access check is not saved. Costs are fetched only when you refresh Usage.</p>
               {(adminError || (adminValidationVisible && (!adminLabel.trim() || !adminKey.trim()) ? adminMissingMessage() : "")) && <p className="form-error">{adminError || adminMissingMessage()}</p>}
               <button className="primary-button modal-submit" onClick={() => void saveAdminKey()} disabled={savingAdmin || !adminLabel.trim() || !adminKey.trim()}>{savingAdmin ? <Loader2 className="spin" size={17} /> : <Plus size={17} />}{savingAdmin ? "Checking Costs API access…" : "Validate & save Admin key"}</button>
-
-            {adminKeys.length > 0 && <>
-              <h3 className="settings-subheading">Minefia Audio dedicated Project</h3>
-              {appProject.projectId ? <div className="app-project-status">
-                <strong>{appProject.projectName || "Minefia Audio"}</strong>
-                <span>{appProject.createdByApp ? "Project created" : "Existing Project selected"} · {appProject.projectId}</span>
-                {appProject.serviceAccountName && <small>Service Account: {appProject.serviceAccountName} · its API key is stored in Keychain.</small>}
-                {!appProject.serviceAccountId && <p className="validation-note">The Project exists. Enter a Service Account name below to finish creating its Project API key.</p>}
-              </div> : <>
-                <p className="validation-note">Recommended: create one Project dedicated to this app. You can also select an existing Project. OpenAI Projects cannot be deleted.</p>
-                <div className="setup-choice-tabs">
-                  <button className={projectMode === "create" ? "selected" : ""} onClick={() => setProjectMode("create")}><FolderPlus size={15} /> Create new Project <small>Recommended</small></button>
-                  <button className={projectMode === "select" ? "selected" : ""} onClick={() => { setSelectedOpenAiProject(null); setProjectMode("select"); }}><List size={15} /> Select existing Project</button>
-                </div>
-                {projectMode === "select" ? <>
-                  {loadingProjects ? <div className="project-list-loading"><Loader2 className="spin" size={17} /> Loading organization Projects…</div> : <div className="setup-project-list">
-                    {openAiProjects.map((project) => <button key={project.id} className={`setup-project-option ${selectedOpenAiProject?.id === project.id ? "selected" : ""}`} onClick={() => setSelectedOpenAiProject(project)}>
-                      <span className="radio-mark">{selectedOpenAiProject?.id === project.id && <Check size={12} />}</span><span><strong>{project.name}</strong><small>{project.id}</small></span>
-                    </button>)}
-                    {openAiProjects.length === 0 && !adminError && <p className="validation-note">No active Projects were returned for this Admin key.</p>}
-                  </div>}
-                </> : <><label className="field-label" htmlFor="app-project-name">Project name</label><input className="text-field" id="app-project-name" value={appProjectName} onChange={(event) => setAppProjectName(event.target.value)} placeholder="Minefia Audio" /></>}
-              </>}
-              {!appProject.serviceAccountId && <>
-                {appProject.projectId && <p className="validation-note">Create a Service Account in this Project to enable Usage and securely register its Project API key.</p>}
-                <label className="field-label second-label" htmlFor="app-service-account-name">Service Account name / Keychain item name</label>
-                <input className="text-field" id="app-service-account-name" value={serviceAccountName} onChange={(event) => setServiceAccountName(event.target.value)} placeholder="Minefia Audio" />
-                <button className="primary-button modal-submit" onClick={() => void createAppProject()} disabled={creatingAppProject || loadingProjects || !serviceAccountName.trim() || (!appProject.projectId && projectMode === "create" && !appProjectName.trim()) || (!appProject.projectId && projectMode === "select" && !selectedOpenAiProject)}>{creatingAppProject ? <Loader2 className="spin" size={17} /> : <Plus size={17} />}{creatingAppProject ? "Creating Project key…" : appProject.projectId ? "Create Service Account key" : projectMode === "select" ? "Create Service Account and add key" : "Create Project and Service Account key"}</button>
-              </>}
-            </>}
             </section>
           </>}
 
+          {tab === "projects" && adminKeys.length > 0 && <section className="settings-section">
+              <h3 className="settings-subheading">Minefia Audio Projects & Service Accounts</h3>
+              <p className="validation-note">Add multiple Projects and Service Accounts. Each generated Project API key is also saved independently in the Project API keys list above. OpenAI Projects cannot be deleted from this app.</p>
+              {appProjects.length > 0 ? <div className="minefia-project-list">
+                {appProjects.map((project) => <article className="app-project-status" key={project.projectId}>
+                  <strong>{project.projectName}</strong>
+                  <span>{project.createdByApp ? "Created by Minefia Audio" : "Existing OpenAI Project"} · {project.projectId}</span>
+                  {project.serviceAccounts.length ? <div className="minefia-service-account-list">
+                    {project.serviceAccounts.map((account) => <small key={account.serviceAccountId}><span><b>{account.serviceAccountName}</b> · {account.serviceAccountId}</span><em>{keys.some((item) => item.openaiKeyId === account.apiKeyId) ? "Project key saved" : "Key not available in Keychain"}</em></small>)}
+                  </div> : <small>No Service Accounts are registered yet.</small>}
+                </article>)}
+              </div> : <p className="validation-note">No Projects are registered with Minefia Audio yet.</p>}
+              <h3 className="settings-subheading">Add Project or Service Account</h3>
+              <div className="setup-choice-tabs">
+                <button className={projectMode === "create" ? "selected" : ""} onClick={() => setProjectMode("create")}><FolderPlus size={15} /> Create new Project <small>Recommended</small></button>
+                <button className={projectMode === "select" ? "selected" : ""} onClick={() => { setSelectedOpenAiProject(null); setProjectMode("select"); }}><List size={15} /> Use existing Project</button>
+              </div>
+              {projectMode === "select" ? <>
+                {loadingProjects ? <div className="project-list-loading"><Loader2 className="spin" size={17} /> Loading organization Projects…</div> : <div className="setup-project-list">
+                  {openAiProjects.map((project) => <button key={project.id} className={`setup-project-option ${selectedOpenAiProject?.id === project.id ? "selected" : ""}`} onClick={() => setSelectedOpenAiProject(project)}>
+                    <span className="radio-mark">{selectedOpenAiProject?.id === project.id && <Check size={12} />}</span><span><strong>{project.name}</strong><small>{project.id}{appProjects.some((minefia) => minefia.projectId === project.id) ? " · already registered" : ""}</small></span>
+                  </button>)}
+                  {openAiProjects.length === 0 && !adminError && <p className="validation-note">No active Projects were returned for this Admin key.</p>}
+                </div>}
+              </> : <>
+                <label className="field-label" htmlFor="app-project-name">Project name</label>
+                <input className="text-field" id="app-project-name" value={appProjectName} onChange={(event) => setAppProjectName(event.target.value)} placeholder="Minefia Audio" />
+              </>}
+              <label className="field-label second-label" htmlFor="app-service-account-name">Service Account name / Keychain item name</label>
+              <input className="text-field" id="app-service-account-name" value={serviceAccountName} onChange={(event) => setServiceAccountName(event.target.value)} placeholder="Minefia Audio" />
+              <button className="primary-button modal-submit" onClick={() => void createAppProject()} disabled={creatingAppProject || loadingProjects || !serviceAccountName.trim() || (projectMode === "create" && !appProjectName.trim()) || (projectMode === "select" && !selectedOpenAiProject)}>{creatingAppProject ? <Loader2 className="spin" size={17} /> : <Plus size={17} />}{creatingAppProject ? "Creating Service Account key…" : projectMode === "select" ? "Add Service Account and key" : "Create Project and Service Account key"}</button>
+          </section>}
+
           {tab === "general" && <>
+            <section className="settings-section">
+              <h3>Audio capture</h3>
+              <label className="field-label" htmlFor="capture-quality">Microphone &amp; System Audio quality</label>
+              <select className="text-field" id="capture-quality" value={captureQuality} onChange={(event) => onCaptureQualityChange(event.target.value as Props["captureQuality"])} disabled={availableCaptureQualities.length === 0}>
+                {availableCaptureQualities.length === 0 && <option value={captureQuality}>No supported PCM preset for this microphone</option>}
+                {availableCaptureQualities.includes("low") && <option value="low">Low · 16 kHz · AAC 32 kbps when Compact is on</option>}
+                {availableCaptureQualities.includes("standard") && <option value="standard">Standard · 16 kHz · AAC 64 kbps when Compact is on</option>}
+                {availableCaptureQualities.includes("high") && <option value="high">High · 24 kHz · AAC 96 kbps when Compact is on</option>}
+                {availableCaptureQualities.includes("best") && <option value="best">Best · 48 kHz · AAC 128 kbps when Compact is on</option>}
+              </select>
+              <p className="validation-note">{captureQualityRestrictionNote} This preset sets the output sample rate from the start of recording. For microphone capture, presets above the device’s maximum supported rate are hidden in both PCM/WAV and Compact AAC modes, so the app never upsamples the microphone. Higher-rate input can still be downsampled to a lower preset. Uncompressed WAV uses about 115 MB/hour at 16 kHz, 173 MB/hour at 24 kHz, or 346 MB/hour at 48 kHz. Local files are not changed.</p>
+              <div className="settings-error-option">
+                <div><strong>Microphone &amp; System Audio Compact</strong><p className="validation-note">One shared recording setting. When on, both sources are saved as mono AAC using the selected bitrate and sample rate. When off, both are saved as uncompressed mono WAV. Online media is always extracted without re-encoding.</p></div>
+                <button className={`toggle ${compactEnabled ? "on" : ""}`} role="switch" aria-checked={compactEnabled} aria-label="Compact audio" onClick={() => onCompactEnabledChange(!compactEnabled)}><i /></button>
+              </div>
+            </section>
             <section className="settings-section">
               <h3>Processing</h3>
               <label className="field-label" htmlFor="parallel-requests">Maximum concurrent transcription requests</label>

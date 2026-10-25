@@ -47,6 +47,9 @@ nav { height: 72px; padding: 0 5.5vw; display: flex; align-items: center; justif
 .usage-permission-note { display: grid; gap: 5px; margin: 14px 0 2px; padding: 12px 13px; border: 1px solid #e4e9e1; border-radius: 10px; color: #748077; background: #f4f6f2; font-size: 10px; line-height: 1.55; overflow-wrap: anywhere; }
 .usage-permission-note strong { color: #46564a; font-size: 10px; }
 .notes-panel { background: #f7fafc; border-color: #dce6ef; }
+.notes-style-options { display: flex; gap: 8px; margin: 2px 0 10px; flex-wrap: wrap; }
+.notes-style-options button { border: 1px solid var(--line); border-radius: 9px; padding: 8px 12px; background: #fff; color: var(--muted); font: inherit; cursor: pointer; }
+.notes-style-options button.selected { border-color: var(--green); background: #e8f2e8; color: var(--green-dark); font-weight: 650; }
 .summary-translation-tools .translation-actions button.selected { background: #e8f2e8; color: var(--green-dark); }
 .status-dot, .pulse-dot { width: 7px; height: 7px; border-radius: 99px; background: #b0b4b0; }
 .status-dot.connected { background: #41a578; box-shadow: 0 0 0 3px rgba(65,165,120,.13); }
@@ -69,6 +72,12 @@ main { width: min(1160px, 89vw); margin: 0 auto; padding: 68px 0 48px; }
 .setup-choice-tabs small { color: var(--green); font-size: 10px; font-weight: 700; }
 .app-project-status { display: grid; gap: 5px; padding: 13px 14px; margin: 10px 0; border: 1px solid var(--line); border-radius: 12px; background: #fff; }
 .app-project-status span, .app-project-status small { color: var(--muted); overflow-wrap: anywhere; }
+.minefia-project-list { display: grid; gap: 8px; max-height: 280px; overflow-y: auto; margin: 10px 0; }
+.minefia-service-account-list { display: grid; gap: 7px; margin-top: 5px; }
+.minefia-service-account-list small { display: grid; gap: 3px; padding: 8px 9px; border-radius: 8px; background: #f7f9f5; }
+.minefia-service-account-list small > span { color: #536157; }
+.minefia-service-account-list b { color: #34483a; }
+.minefia-service-account-list em { color: var(--green-dark); font-size: 9px; font-style: normal; font-weight: 650; }
 .setup-project-list { display: grid; gap: 6px; max-height: 210px; overflow-y: auto; margin: 10px 0 4px; padding: 2px; }
 .setup-project-option { width: 100%; display: flex; align-items: center; gap: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: #fff; text-align: left; cursor: pointer; }
 .setup-project-option.selected { border-color: var(--green); background: #eff6eb; }
@@ -183,6 +192,8 @@ main { width: min(1160px, 89vw); margin: 0 auto; padding: 68px 0 48px; }
 .online-quality-select { display: grid; gap: 6px; margin: 10px 0; color: #657168; font-size: 10px; font-weight: 650; }
 .online-quality-select select { width: 100%; min-width: 0; padding: 10px 11px; border: 1px solid #dfe5dc; border-radius: 8px; background: #fff; color: #35413a; font: inherit; }
 .online-quality-select small { color: #879188; font-size: 9px; font-weight: 400; line-height: 1.5; }
+.caption-picker .transcribe-button { justify-content: flex-start; text-align: left; }
+.caption-picker .transcribe-button svg:last-child { margin-left: 0; }
 .online-format small { color: #939a94; font-size: 8px; font-weight: 700; letter-spacing: .7px; }
 .online-format strong { color: #4f5c55; font-size: 11px; }
 .online-format span, .online-quality-note, .conversion-required-note { margin: 0; color: #7e8780; font-size: 9px; line-height: 1.5; }
@@ -201,6 +212,10 @@ main { width: min(1160px, 89vw); margin: 0 auto; padding: 68px 0 48px; }
 .device-state { display: flex; align-items: center; gap: 7px; margin: 11px 0 8px; color: #818a83; font-size: 10px; }
 .device-state i { width: 7px; height: 7px; border-radius: 50%; background: #b4b9b5; }
 .device-state i.connected { background: #4a9b69; box-shadow: 0 0 0 3px #e8f4eb; }
+.device-state .compact-state { display: inline-flex; align-items: center; gap: 5px; padding: 3px 7px; border: 1px solid var(--line); border-radius: 999px; background: white; font-size: 9px; line-height: 1; }
+.device-state .compact-state i { width: 6px; height: 6px; box-shadow: none; }
+.device-state .compact-state.enabled i { background: #4a9b69; }
+.device-state .compact-state.disabled i { background: #a8afaa; }
 .device-state button { display: grid; place-items: center; width: 24px; height: 24px; margin-left: auto; border: 1px solid var(--line); border-radius: 7px; color: #78827b; background: white; cursor: pointer; }
 .device-state button:disabled { opacity: .5; cursor: not-allowed; }
 .input-level-meter { height: 6px; overflow: hidden; border-radius: 8px; background: #edf0ed; }

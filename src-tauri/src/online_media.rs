@@ -128,6 +128,16 @@ pub struct OnlineMediaInfo {
     pub video_height: Option<u32>,
     pub requires_conversion: bool,
     pub available_formats: Vec<OnlineMediaFormat>,
+    pub captions: Vec<OnlineCaption>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OnlineCaption {
+    pub id: String,
+    pub language: String,
+    pub label: String,
+    pub automatic: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +149,7 @@ pub struct OnlineMediaFormat {
     pub audio_only: bool,
     pub has_video: bool,
     pub audio_codec: String,
+    pub language: Option<String>,
     pub audio_bitrate_kbps: Option<f64>,
     pub sample_rate_hz: Option<u32>,
     pub video_height: Option<u32>,
@@ -156,7 +167,7 @@ pub struct ExtractRequest {
 }
 
 fn default_headless_mode() -> bool {
-    true
+    false
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -222,6 +233,7 @@ struct Candidate {
     audio_only: bool,
     has_video: bool,
     codec: String,
+    language: Option<String>,
     bitrate: Option<f64>,
     sample_rate: Option<u32>,
     height: Option<u32>,
@@ -282,6 +294,7 @@ pub async fn inspect(
                     candidate,
                     media_url,
                     candidates,
+                    ytdlp_captions(&value),
                 ));
             }
         }
@@ -310,6 +323,7 @@ pub async fn inspect(
             candidate,
             media_url,
             candidates,
+            Vec::new(),
         ));
     }
 
@@ -330,6 +344,7 @@ pub async fn inspect(
                 candidate,
                 media_url,
                 candidates,
+                Vec::new(),
             ));
         }
         if let Some(media) = found.media.first() {
@@ -345,6 +360,7 @@ pub async fn inspect(
                     candidate.clone(),
                     candidate.url.clone(),
                     vec![candidate],
+                    Vec::new(),
                 ));
             }
         }
@@ -382,6 +398,7 @@ pub async fn inspect(
         candidate.clone(),
         candidate.url.clone(),
         vec![candidate],
+        Vec::new(),
     ))
 }
 
@@ -836,6 +853,12 @@ fn ytdlp_candidates(value: &Value) -> Vec<Candidate> {
             audio_only,
             has_video: video_codec != "none",
             codec: normalize_codec(audio_codec),
+            language: format
+                .get("language")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|language| !language.is_empty() && *language != "und")
+                .map(str::to_owned),
             bitrate,
             sample_rate,
             height: format
@@ -852,6 +875,175 @@ fn ytdlp_candidates(value: &Value) -> Vec<Candidate> {
         }
     }
     candidates
+}
+
+fn ytdlp_captions(value: &Value) -> Vec<OnlineCaption> {
+    let mut captions = Vec::new();
+    for (field, automatic) in [("subtitles", false), ("automatic_captions", true)] {
+        let Some(languages) = value.get(field).and_then(Value::as_object) else {
+            continue;
+        };
+        for (language, entries) in languages {
+            let Some(entries) = entries.as_array() else {
+                continue;
+            };
+            if entries.is_empty() {
+                continue;
+            }
+            let display = display_language(language);
+            let label = if automatic {
+                format!("{display} · auto-generated caption")
+            } else {
+                format!("{display} · provided caption")
+            };
+            captions.push(OnlineCaption {
+                id: format!("{}:{language}", if automatic { "auto" } else { "manual" }),
+                language: language.to_owned(),
+                label,
+                automatic,
+            });
+        }
+    }
+    captions.sort_by(|left, right| {
+        left.automatic
+            .cmp(&right.automatic)
+            .then_with(|| left.language.cmp(&right.language))
+    });
+    captions
+}
+
+pub async fn download_caption(
+    url: &str,
+    language: &str,
+    automatic: bool,
+) -> Result<String, OnlineMediaError> {
+    validate_url(url).await?;
+    if language.is_empty()
+        || language.len() > 64
+        || !language
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(OnlineMediaError::Inspect(
+            "Invalid caption language.".into(),
+        ));
+    }
+    let metadata = yt_dlp_metadata(url, None).await?.ok_or_else(|| {
+        OnlineMediaError::Inspect("No caption metadata is available for this source.".into())
+    })?;
+    let category = if automatic {
+        "automatic_captions"
+    } else {
+        "subtitles"
+    };
+    if metadata
+        .get(category)
+        .and_then(|captions| captions.get(language))
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty)
+    {
+        return Err(OnlineMediaError::Inspect(
+            "The selected caption is no longer available. Inspect the source again.".into(),
+        ));
+    }
+
+    let directory =
+        tempfile::tempdir().map_err(|error| OnlineMediaError::Download(error.to_string()))?;
+    let output_template = directory.path().join("caption.%(ext)s");
+    let mut command = yt_dlp_command();
+    command.args([
+        "--skip-download",
+        "--no-playlist",
+        "--no-warnings",
+        "--sub-langs",
+        language,
+        "--sub-format",
+        "vtt/best",
+        "--output",
+    ]);
+    command.arg(output_template);
+    command.arg(if automatic {
+        "--write-auto-subs"
+    } else {
+        "--write-subs"
+    });
+    command.arg(url).kill_on_drop(true);
+    let output = timeout(Duration::from_secs(60), command.output())
+        .await
+        .map_err(|_| OnlineMediaError::Download("Caption download timed out.".into()))?
+        .map_err(|error| OnlineMediaError::Download(error.to_string()))?;
+    if !output.status.success() {
+        return Err(OnlineMediaError::Download(
+            String::from_utf8_lossy(&output.stderr)
+                .trim()
+                .chars()
+                .take(500)
+                .collect(),
+        ));
+    }
+    let mut entries = tokio::fs::read_dir(directory.path()).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if !entry.file_type().await?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let bytes = tokio::fs::read(&path).await?;
+        let content = String::from_utf8_lossy(&bytes);
+        let transcript = parse_caption_text(&content);
+        if !transcript.is_empty() {
+            return Ok(transcript);
+        }
+    }
+    Err(OnlineMediaError::Download(
+        "The selected caption downloaded but contained no readable text.".into(),
+    ))
+}
+
+fn parse_caption_text(content: &str) -> String {
+    let mut lines = Vec::new();
+    for line in content.trim_start_matches('\u{feff}').lines() {
+        let line = line.trim();
+        if line.is_empty()
+            || line.starts_with("WEBVTT")
+            || line.starts_with("NOTE")
+            || line.contains("-->")
+            || line.starts_with("STYLE")
+            || line.starts_with("REGION")
+            || line.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            continue;
+        }
+        let plain = strip_caption_tags(line);
+        let decoded = plain
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&nbsp;", " ");
+        if !decoded.trim().is_empty() && lines.last() != Some(&decoded) {
+            lines.push(decoded);
+        }
+    }
+    lines.join("\n")
+}
+
+fn strip_caption_tags(line: &str) -> String {
+    let mut inside_tag = false;
+    line.chars()
+        .filter_map(|character| match character {
+            '<' => {
+                inside_tag = true;
+                None
+            }
+            '>' => {
+                inside_tag = false;
+                None
+            }
+            _ if inside_tag => None,
+            character => Some(character),
+        })
+        .collect()
 }
 
 fn parse_ytdlp_headers(value: Option<&Value>) -> HashMap<String, String> {
@@ -1108,6 +1300,7 @@ async fn probe_candidate(
         audio_only: !has_video,
         has_video,
         codec,
+        language: None,
         bitrate,
         sample_rate: audio
             .sample_rate
@@ -1177,6 +1370,7 @@ fn to_info(
     candidate: Candidate,
     media_url: Option<String>,
     candidates: Vec<Candidate>,
+    captions: Vec<OnlineCaption>,
 ) -> OnlineMediaInfo {
     let bitrate = candidate.bitrate;
     let sample_rate = candidate.sample_rate;
@@ -1203,6 +1397,11 @@ fn to_info(
             quality
         )
     };
+    let label = candidate
+        .language
+        .as_deref()
+        .map(|language| format!("{} · {}", label, display_language(language)))
+        .unwrap_or(label);
     let _ = candidate.extension;
     let recommended_id = choose_candidate(candidates.clone()).map(|item| item.id);
     let mut ordered_candidates = candidates;
@@ -1252,6 +1451,11 @@ fn to_info(
                     item_quality
                 )
             };
+            let label = item
+                .language
+                .as_deref()
+                .map(|language| format!("{} · {}", label, display_language(language)))
+                .unwrap_or(label);
             OnlineMediaFormat {
                 format_id: item.id.clone(),
                 format_label: label,
@@ -1259,6 +1463,7 @@ fn to_info(
                 audio_only: item.audio_only,
                 has_video: item.has_video,
                 audio_codec: item.codec.clone(),
+                language: item.language.clone(),
                 audio_bitrate_kbps: item.bitrate,
                 sample_rate_hz: item.sample_rate,
                 video_height: item.height,
@@ -1294,6 +1499,7 @@ fn to_info(
         video_height: candidate.height,
         requires_conversion: conversion,
         available_formats,
+        captions,
     }
 }
 
@@ -2894,6 +3100,36 @@ fn looks_like_hls(url: &str) -> bool {
     path.ends_with(".m3u8")
 }
 
+fn display_language(language: &str) -> String {
+    let code = language.split(['-', '_']).next().unwrap_or(language);
+    let name = match code.to_ascii_lowercase().as_str() {
+        "ar" => "Arabic",
+        "de" => "German",
+        "en" => "English",
+        "es" => "Spanish",
+        "fr" => "French",
+        "hi" => "Hindi",
+        "it" => "Italian",
+        "ja" => "Japanese",
+        "ko" => "Korean",
+        "nl" => "Dutch",
+        "pl" => "Polish",
+        "pt" => "Portuguese",
+        "ru" => "Russian",
+        "th" => "Thai",
+        "tr" => "Turkish",
+        "uk" => "Ukrainian",
+        "vi" => "Vietnamese",
+        "zh" => "Chinese",
+        _ => return language.to_owned(),
+    };
+    if language.eq_ignore_ascii_case(code) {
+        name.to_owned()
+    } else {
+        format!("{name} ({language})")
+    }
+}
+
 fn file_title(url: &str) -> String {
     reqwest::Url::parse(url)
         .ok()
@@ -3017,6 +3253,25 @@ mod tests {
         );
         assert!(!headers.contains_key("Cookie"));
         assert!(!headers.contains_key("Authorization"));
+    }
+
+    #[test]
+    fn discovers_caption_languages_and_extracts_webvtt_text() {
+        let metadata = serde_json::json!({
+            "subtitles": { "ja": [{ "ext": "vtt" }] },
+            "automatic_captions": { "en-US": [{ "ext": "json3" }] }
+        });
+        let captions = ytdlp_captions(&metadata);
+        assert_eq!(captions.len(), 2);
+        assert_eq!(captions[0].language, "ja");
+        assert!(!captions[0].automatic);
+        assert!(captions[1].automatic);
+        assert!(captions[1].label.contains("English"));
+
+        let text = parse_caption_text(
+            "\u{feff}WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n<c>こんにちは &amp; 世界</c>\n",
+        );
+        assert_eq!(text, "こんにちは & 世界");
     }
 
     #[test]

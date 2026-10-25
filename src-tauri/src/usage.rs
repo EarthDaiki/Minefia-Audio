@@ -72,13 +72,13 @@ pub struct DailyProjectCost {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectCosts {
-    pub project_id: String,
+    pub project_ids: Vec<String>,
     pub days: Vec<DailyProjectCost>,
     pub total_usd: f64,
     pub currency: String,
 }
 
-pub async fn fetch(api_key: &str, project_id: &str) -> Result<ProjectCosts, CostsError> {
+pub async fn fetch(api_key: &str, project_ids: &[String]) -> Result<ProjectCosts, CostsError> {
     let client = Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
         .timeout(std::time::Duration::from_secs(45))
@@ -93,14 +93,15 @@ pub async fn fetch(api_key: &str, project_id: &str) -> Result<ProjectCosts, Cost
     let mut by_day: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
 
     loop {
-        let mut request = client.get(COSTS_URL).bearer_auth(api_key).query(&[
+        let mut query = vec![
             ("start_time", start_time.to_string()),
             ("end_time", end_time.to_string()),
             ("bucket_width", "1d".to_owned()),
             ("limit", "180".to_owned()),
             ("group_by", "line_item".to_owned()),
-            ("project_ids", project_id.to_owned()),
-        ]);
+        ];
+        query.extend(project_ids.iter().map(|id| ("project_ids", id.clone())));
+        let mut request = client.get(COSTS_URL).bearer_auth(api_key).query(&query);
         if let Some(cursor) = &page {
             request = request.query(&[("page", cursor)]);
         }
@@ -187,7 +188,7 @@ pub async fn fetch(api_key: &str, project_id: &str) -> Result<ProjectCosts, Cost
         .collect::<Vec<_>>();
     days.sort_by(|left, right| right.date.cmp(&left.date));
     Ok(ProjectCosts {
-        project_id: project_id.to_owned(),
+        project_ids: project_ids.to_vec(),
         days,
         total_usd,
         currency: "usd".into(),

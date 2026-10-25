@@ -46,8 +46,12 @@ pub fn start(
     api_key: String,
     source: String,
     input_device: Option<String>,
+    quality: String,
+    compact_microphone: bool,
+    compact_system_audio: bool,
 ) -> Result<(), String> {
     system_audio::validate_source(&source, input_device.as_deref())?;
+    let profile = system_audio::CaptureProfile::parse(&quality)?;
     let mut active = manager
         .active
         .lock()
@@ -64,7 +68,16 @@ pub fn start(
     let stop = Arc::new(AtomicBool::new(false));
     *active = Some(stop.clone());
     drop(active);
-    tauri::async_runtime::spawn(run(app, api_key, source, input_device, stop));
+    tauri::async_runtime::spawn(run(
+        app,
+        api_key,
+        source,
+        input_device,
+        profile,
+        compact_microphone,
+        compact_system_audio,
+        stop,
+    ));
     Ok(())
 }
 
@@ -85,6 +98,9 @@ async fn run(
     api_key: String,
     source: String,
     input_device: Option<String>,
+    profile: system_audio::CaptureProfile,
+    compact_microphone: bool,
+    compact_system_audio: bool,
     stop: Arc<AtomicBool>,
 ) {
     let (audio_tx, audio_rx) = mpsc::sync_channel::<PcmBatch>(2048);
@@ -100,6 +116,9 @@ async fn run(
                 &source,
                 input_device.as_deref(),
                 &capture_app,
+                profile,
+                compact_microphone,
+                compact_system_audio,
             ) {
                 if !capture_control.load(Ordering::Acquire) {
                     emit(&capture_app, "error", 0.0, None, false, Some(message));
@@ -123,6 +142,7 @@ async fn run(
     let mut last_progress = tokio::time::Instant::now();
     let mut captions = HashMap::<String, String>::new();
     let mut item_order = Vec::<String>::new();
+    let mut resample_phase = 0_u64;
 
     while !stop.load(Ordering::Acquire) {
         let mut request = match format!("wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}")
@@ -202,7 +222,11 @@ async fn run(
         while !stop.load(Ordering::Acquire) && !disconnected {
             if configured {
                 if let Ok(batch) = audio_rx.try_recv() {
-                    let samples = stereo_48k_to_mono_24k(&batch.samples);
+                    let samples = capture_to_live_mono_24k(
+                        &batch.samples,
+                        batch.sample_rate,
+                        &mut resample_phase,
+                    );
                     if !samples.is_empty() {
                         let max_level = samples
                             .iter()
@@ -418,13 +442,26 @@ fn update_caption(event: &Value, captions: &mut HashMap<String, String>, order: 
     }
 }
 
-fn stereo_48k_to_mono_24k(input: &[i16]) -> Vec<i16> {
-    input
-        .chunks_exact(4)
-        .map(|frame| {
-            ((frame[0] as i32 + frame[1] as i32 + frame[2] as i32 + frame[3] as i32) / 4) as i16
-        })
-        .collect()
+fn capture_to_live_mono_24k(input: &[i16], sample_rate: u32, phase: &mut u64) -> Vec<i16> {
+    match sample_rate {
+        48_000 => input
+            .chunks_exact(2)
+            .map(|frame| ((i32::from(frame[0]) + i32::from(frame[1])) / 2) as i16)
+            .collect(),
+        24_000 => input.to_vec(),
+        16_000 => {
+            let mut output = Vec::with_capacity(input.len() / 2 * 3);
+            for mono in input {
+                *phase += u64::from(LIVE_SAMPLE_RATE);
+                while *phase >= 16_000 {
+                    output.push(*mono);
+                    *phase -= 16_000;
+                }
+            }
+            output
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn encode_pcm(samples: &[i16]) -> String {

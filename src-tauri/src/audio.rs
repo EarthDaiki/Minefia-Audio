@@ -154,6 +154,7 @@ pub async fn inspect(path: &Path) -> Result<AudioInfo, AudioError> {
 pub async fn prepare(
     source: &Path,
     compress_audio: bool,
+    compression_quality: &str,
     audio_stream_index: u32,
     allow_reencode: bool,
     work_dir: &Path,
@@ -181,7 +182,7 @@ pub async fn prepare(
 
     let prepared = if compress_audio {
         let compressed = work_dir.join("compressed.m4a");
-        compress(source, &compressed, audio_stream_index).await?;
+        compress(source, &compressed, audio_stream_index, compression_quality).await?;
         compressed
     } else if let Some(extension) = lossless_output_extension(codec) {
         let container_is_compatible = is_api_compatible_audio_file(
@@ -197,7 +198,7 @@ pub async fn prepare(
                 Ok(()) => extracted,
                 Err(AudioError::Convert(_)) if allow_reencode => {
                     let converted = work_dir.join("converted.m4a");
-                    compress(source, &converted, audio_stream_index).await?;
+                    compress(source, &converted, audio_stream_index, compression_quality).await?;
                     converted
                 }
                 Err(AudioError::Convert(_)) => return Err(AudioError::ConversionApprovalRequired),
@@ -206,7 +207,7 @@ pub async fn prepare(
         }
     } else if allow_reencode {
         let converted = work_dir.join("converted.m4a");
-        compress(source, &converted, audio_stream_index).await?;
+        compress(source, &converted, audio_stream_index, compression_quality).await?;
         converted
     } else {
         return Err(AudioError::ConversionApprovalRequired);
@@ -392,15 +393,39 @@ async fn extract_without_reencoding(
     Ok(())
 }
 
-async fn compress(source: &Path, output: &Path, audio_stream_index: u32) -> Result<(), AudioError> {
+async fn compress(
+    source: &Path,
+    output: &Path,
+    audio_stream_index: u32,
+    quality: &str,
+) -> Result<(), AudioError> {
+    let (sample_rate, bitrate) = match quality {
+        "low" => (16_000, 32),
+        "standard" => (16_000, 64),
+        "high" => (24_000, 96),
+        "best" => (48_000, 128),
+        _ => {
+            return Err(AudioError::Convert(
+                "Choose a supported compact audio quality.".into(),
+            ))
+        }
+    };
     let binary = find_binary("ffmpeg").ok_or(AudioError::FfmpegMissing)?;
     let result = Command::new(binary)
         .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(source)
         .arg("-map")
         .arg(format!("0:{audio_stream_index}"))
-        .args(["-vn", "-map_metadata", "-1", "-ac", "1", "-ar", "16000"])
-        .args(["-codec:a", "aac", "-b:a", "64k"])
+        .args([
+            "-vn",
+            "-map_metadata",
+            "-1",
+            "-ac",
+            "1",
+            "-ar",
+            &sample_rate.to_string(),
+        ])
+        .args(["-codec:a", "aac", "-b:a", &format!("{bitrate}k")])
         .arg(output)
         .output()
         .await?;
@@ -502,7 +527,7 @@ fn nearest_silence(target: f64, start: f64, end: f64, silences: &[f64]) -> Optio
         .min_by(|left, right| (left - target).abs().total_cmp(&(right - target).abs()))
 }
 
-fn find_binary(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_binary(name: &str) -> Option<PathBuf> {
     let override_name = format!("MINEFIA_{}", name.to_uppercase());
     if let Some(path) = env::var_os(override_name)
         .map(PathBuf::from)

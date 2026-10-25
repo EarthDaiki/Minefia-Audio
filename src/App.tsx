@@ -42,10 +42,7 @@ import { estimatePartCount, estimateTranscriptionCost, estimateTranslationCost, 
 import { splitReadableSections } from "./lib/textSections";
 import { errorMessage } from "./lib/errors";
 import { rememberOpenAIKeyId } from "./lib/keyMetadata";
-import type { AdminApiKeySummary, ApiKeySummary, AudioInfo, AvailableModels, InputDevice, LibraryFile, MinefiaProject, OnlineMediaInfo, PageMediaInfo, ProjectCosts, RealtimeAudioEvent, ResumableJob, SavedTranscript, SummaryEvent, SystemAudioEvent, TranscriptVersion, TranscriptionEvent, TranscribeRequest, TranslationEvent } from "./types";
-
-const MAX_BYTES = 20_000_000;
-const TARGET_PART_SECONDS = 5 * 60;
+import type { AdminApiKeySummary, ApiKeySummary, AudioInfo, AvailableModels, InputDevice, LibraryFile, OnlineMediaInfo, PageMediaInfo, ProjectCosts, RealtimeAudioEvent, ResumableJob, SavedTranscript, SummaryEvent, SystemAudioEvent, TranscriptVersion, TranscriptionEvent, TranscribeRequest, TranslationEvent } from "./types";
 
 type OnlineDownloadProgressEvent = {
   stage: string;
@@ -58,6 +55,12 @@ type OnlineDownloadProgressEvent = {
 
 type TechnicalLogEntry = { taskId: string; taskName: string; timestamp: string; category: string; message: string };
 type TechnicalTask = { id: string; name: string };
+const CAPTURE_QUALITY_PRESETS = [
+  { key: "low", sampleRate: 16_000, bitrate: 32, label: "Low" },
+  { key: "standard", sampleRate: 16_000, bitrate: 64, label: "Standard" },
+  { key: "high", sampleRate: 24_000, bitrate: 96, label: "High" },
+  { key: "best", sampleRate: 48_000, bitrate: 128, label: "Best" },
+] as const;
 
 function transcriptionRateLabel(model: (typeof TRANSCRIPTION_MODELS)[number]): string {
   return model.pricingLabel ?? `$${model.pricePerMinute}/min`;
@@ -117,6 +120,11 @@ export default function App() {
     const value = Number(localStorage.getItem("parallel-requests") ?? "2");
     return Number.isInteger(value) && value >= 1 && value <= 4 ? value : 2;
   });
+  const [captureQuality, setCaptureQuality] = useState<"low" | "standard" | "high" | "best">(() => {
+    const value = localStorage.getItem("capture-quality");
+    return value === "low" || value === "standard" || value === "high" || value === "best" ? value : "standard";
+  });
+  const [compactEnabled, setCompactEnabled] = useState(() => localStorage.getItem("compact-enabled") !== "false");
   const [technicalErrors, setTechnicalErrors] = useState(() => localStorage.getItem("technical-errors") === "true");
   const [technicalDetails, setTechnicalDetails] = useState(() => localStorage.getItem("technical-details") === "true");
   const [technicalLogs, setTechnicalLogs] = useState<TechnicalLogEntry[]>([]);
@@ -124,12 +132,25 @@ export default function App() {
   const technicalTaskRef = useRef<TechnicalTask | null>(null);
   const lastTechnicalLogRef = useRef<{ signature: string; at: number } | null>(null);
   const lastLoggedDownloadProgress = useRef({ stage: "", bytes: 0, partMark: -1, percentMark: -1 });
-  const [headlessBrowser, setHeadlessBrowser] = useState(() => localStorage.getItem("headless-browser") !== "false");
+  const [headlessBrowser, setHeadlessBrowser] = useState(() => localStorage.getItem("headless-browser") === "true");
   const [resumableJobs, setResumableJobs] = useState<ResumableJob[]>([]);
   const [captureSource, setCaptureSource] = useState<"system" | "microphone" | "both">("system");
   const [captureMode, setCaptureMode] = useState<"standard" | "live">("standard");
   const [inputDevices, setInputDevices] = useState<InputDevice[]>([]);
+  const [inputDevicesLoading, setInputDevicesLoading] = useState(false);
   const [selectedInputDevice, setSelectedInputDevice] = useState("");
+  const selectedCaptureInputDevice = inputDevices.find((device) => device.id === selectedInputDevice);
+  const microphoneRateConstraint = captureSource !== "system";
+  const microphoneMaxSampleRate = selectedCaptureInputDevice?.maxSupportedSampleRate
+    ?? selectedCaptureInputDevice?.defaultSampleRate
+    ?? Math.max(0, ...(selectedCaptureInputDevice?.supportedSampleRates ?? []));
+  const availableCaptureQualities = microphoneRateConstraint
+    ? CAPTURE_QUALITY_PRESETS.filter((preset) => preset.sampleRate <= microphoneMaxSampleRate)
+        .map((preset) => preset.key)
+    : CAPTURE_QUALITY_PRESETS.map((preset) => preset.key);
+  const captureQualityRestrictionNote = microphoneRateConstraint
+    ? `${selectedCaptureInputDevice?.name ?? "The selected microphone"} supports up to ${microphoneMaxSampleRate ? `${microphoneMaxSampleRate / 1000} kHz` : "no reported sample rate"}. Higher output presets are hidden for both PCM and AAC to avoid upsampling.`
+    : "All recording presets are available for the current source and Compact settings.";
   const [inputLevel, setInputLevel] = useState(0);
   const [savedTranscripts, setSavedTranscripts] = useState<SavedTranscript[]>([]);
   const [libraryFiles, setLibraryFiles] = useState<LibraryFile[]>([]);
@@ -144,7 +165,10 @@ export default function App() {
   const [enhancedTranscript, setEnhancedTranscript] = useState("");
   const [summaryMode, setSummaryMode] = useState(false);
   const [notesMode, setNotesMode] = useState(false);
+  const [notesStyle, setNotesStyle] = useState<"meeting" | "study">("meeting");
   const [notesText, setNotesText] = useState("");
+  const [notesTranslations, setNotesTranslations] = useState<Record<string, string>>({});
+  const [notesTranslating, setNotesTranslating] = useState(false);
   const [summaryTranslationLive, setSummaryTranslationLive] = useState(false);
   const [summaryText, setSummaryText] = useState("");
   const [summaryDraft, setSummaryDraft] = useState("");
@@ -182,7 +206,6 @@ export default function App() {
     const stored = localStorage.getItem("question-model");
     return TRANSLATION_MODELS.some((item) => item.id === stored) ? stored! : "gpt-6-luna";
   });
-  const [compressAudio, setCompressAudio] = useState(false);
   const [model, setModel] = useState(() => {
     const stored = localStorage.getItem("transcription-model");
     return TRANSCRIPTION_MODELS.some((item) => item.id === stored) ? stored! : "gpt-transcribe";
@@ -214,6 +237,8 @@ export default function App() {
   const [webPageInfo, setWebPageInfo] = useState<PageMediaInfo | null>(null);
   const [webPageInspecting, setWebPageInspecting] = useState(false);
   const [onlineMedia, setOnlineMedia] = useState<OnlineMediaInfo | null>(null);
+  const [selectedOnlineCaptionId, setSelectedOnlineCaptionId] = useState("");
+  const [onlineCaptionLoading, setOnlineCaptionLoading] = useState(false);
   const [onlineInspecting, setOnlineInspecting] = useState(false);
   const [onlineExtracting, setOnlineExtracting] = useState(false);
   const [onlineDownloadProgress, setOnlineDownloadProgress] = useState<OnlineDownloadProgressEvent | null>(null);
@@ -259,6 +284,7 @@ export default function App() {
   const summaryTextRef = useRef("");
   const summaryModeRef = useRef(false);
   const notesModeRef = useRef(false);
+  const notesStyleRef = useRef<"meeting" | "study">("meeting");
   const summaryTranslationLiveRef = useRef(false);
   const notesTextRef = useRef("");
   const summaryModelRef = useRef(translationModel);
@@ -268,6 +294,7 @@ export default function App() {
   const summaryQueue = useRef<Promise<void>>(Promise.resolve());
   const liveFinalTranscript = useRef("");
   const livePersistedTranscript = useRef("");
+  const systemCaptureFinalized = useRef(true);
   const transcriptSessionId = useRef("");
   const transcriptSessionName = useRef("Transcript");
   const transcriptAttempts = useRef<Record<number, number>>({});
@@ -277,22 +304,25 @@ export default function App() {
   const batchTranscriptionActive = useRef(false);
   const transcriptPersistenceQueue = useRef<Promise<void>>(Promise.resolve());
   const liveTranscriptAttempt = useRef(0);
+  const systemCommittedTranscript = useRef("");
+  const systemCompletedChunksRef = useRef(0);
+  const systemStreamedParts = useRef<Record<number, string>>({});
   const transcriptTabs = useRef<Record<"file" | "online" | "system", {
     transcript: string; originalTranscript: string; enhancedTranscript: string; summaryText: string; translations: Record<string, string>;
     summaryTranslations: Record<string, string>; questionMessages: { role: "user" | "assistant"; text: string }[];
-    notesText: string; notesMode: boolean; summaryTranslationLive: boolean;
+    notesText: string; notesMode: boolean; notesStyle: "meeting" | "study"; notesTranslations: Record<string, string>; summaryTranslationLive: boolean;
     activeLanguage: string; completed: boolean; summaryMode: boolean; translationEnabled: boolean;
     sessionId: string; sessionName: string;
   }>>({
-    file: { transcript: "", originalTranscript: "", enhancedTranscript: "", summaryText: "", notesText: "", notesMode: false, summaryTranslationLive: false, translations: {}, summaryTranslations: {}, questionMessages: [], activeLanguage: "Original", completed: false, summaryMode: false, translationEnabled: false, sessionId: "", sessionName: "Transcript" },
-    online: { transcript: "", originalTranscript: "", enhancedTranscript: "", summaryText: "", notesText: "", notesMode: false, summaryTranslationLive: false, translations: {}, summaryTranslations: {}, questionMessages: [], activeLanguage: "Original", completed: false, summaryMode: false, translationEnabled: false, sessionId: "", sessionName: "Transcript" },
-    system: { transcript: "", originalTranscript: "", enhancedTranscript: "", summaryText: "", notesText: "", notesMode: false, summaryTranslationLive: false, translations: {}, summaryTranslations: {}, questionMessages: [], activeLanguage: "Original", completed: false, summaryMode: false, translationEnabled: false, sessionId: "", sessionName: "Transcript" },
+    file: { transcript: "", originalTranscript: "", enhancedTranscript: "", summaryText: "", notesText: "", notesMode: false, notesStyle: "meeting", notesTranslations: {}, summaryTranslationLive: false, translations: {}, summaryTranslations: {}, questionMessages: [], activeLanguage: "Original", completed: false, summaryMode: false, translationEnabled: false, sessionId: "", sessionName: "Transcript" },
+    online: { transcript: "", originalTranscript: "", enhancedTranscript: "", summaryText: "", notesText: "", notesMode: false, notesStyle: "meeting", notesTranslations: {}, summaryTranslationLive: false, translations: {}, summaryTranslations: {}, questionMessages: [], activeLanguage: "Original", completed: false, summaryMode: false, translationEnabled: false, sessionId: "", sessionName: "Transcript" },
+    system: { transcript: "", originalTranscript: "", enhancedTranscript: "", summaryText: "", notesText: "", notesMode: false, notesStyle: "meeting", notesTranslations: {}, summaryTranslationLive: false, translations: {}, summaryTranslations: {}, questionMessages: [], activeLanguage: "Original", completed: false, summaryMode: false, translationEnabled: false, sessionId: "", sessionName: "Transcript" },
   });
 
   function switchSourceMode(next: "file" | "online" | "system") {
     if (next === sourceMode) return;
     transcriptTabs.current[sourceMode] = {
-      transcript, originalTranscript, enhancedTranscript, summaryText, notesText, notesMode, summaryTranslationLive, translations, summaryTranslations, questionMessages, activeLanguage, completed, summaryMode, translationEnabled,
+      transcript, originalTranscript, enhancedTranscript, summaryText, notesText, notesMode, notesStyle, notesTranslations, summaryTranslationLive, translations, summaryTranslations, questionMessages, activeLanguage, completed, summaryMode, translationEnabled,
       sessionId: transcriptSessionId.current, sessionName: transcriptSessionName.current,
     };
     const saved = transcriptTabs.current[next];
@@ -308,6 +338,9 @@ export default function App() {
     setSummaryText(saved.summaryText);
     setNotesText(saved.notesText);
     setNotesMode(saved.notesMode);
+    setNotesStyle(saved.notesStyle);
+    notesStyleRef.current = saved.notesStyle;
+    setNotesTranslations(saved.notesTranslations);
     notesModeRef.current = saved.notesMode;
     setSummaryTranslationLive(saved.summaryTranslationLive);
     summaryTranslationLiveRef.current = saved.summaryTranslationLive;
@@ -337,6 +370,29 @@ export default function App() {
     setEnhancedTranscript("");
     setActiveLanguage("Original");
     return transcriptSessionId.current;
+  }
+
+  function renderSystemTranscriptPreview() {
+    const committed = systemCommittedTranscript.current;
+    const partial = systemStreamedParts.current[systemCompletedChunksRef.current + 1] ?? "";
+    const preview = partial ? `${committed}${committed ? "\n" : ""}${partial}` : committed;
+    const tab = transcriptTabs.current.system;
+    tab.transcript = preview;
+    tab.originalTranscript = preview;
+    if (sourceModeRef.current === "system") {
+      setTranscript(preview);
+      setOriginalTranscript(preview);
+    }
+    return preview;
+  }
+
+  function commitSystemTranscriptChunk(chunk: number, text: string, completed: number) {
+    const previous = systemCommittedTranscript.current;
+    systemCommittedTranscript.current = `${previous}${previous ? "\n" : ""}${text}`;
+    systemCompletedChunksRef.current = completed;
+    delete systemStreamedParts.current[chunk];
+    setSystemCompletedChunks(completed);
+    return renderSystemTranscriptPreview();
   }
 
   function toggleCaptureInput(input: "system" | "microphone") {
@@ -414,9 +470,8 @@ export default function App() {
 
   async function refreshProjectUsage() {
     try {
-      const project = await invoke<MinefiaProject>("get_minefia_project");
       const ready = await invoke<boolean>("minefia_usage_ready");
-      rememberOpenAIKeyId(ready ? project.apiKeyId : null);
+      rememberOpenAIKeyId(null);
       setProjectUsageReady(ready);
       if (!ready) setUsageOpen(false);
     } catch {
@@ -468,6 +523,9 @@ export default function App() {
     switchSourceMode("file");
     const isSummary = item.kind === "summary";
     const isNotes = item.kind === "notes";
+    const isStudyNotes = item.kind === "study_notes";
+    const isNotesTranslation = item.kind === "notes_translation";
+    const requestedNotesStyle: "meeting" | "study" = isStudyNotes || (isNotesTranslation && item.id.split(":")[2] === "study") ? "study" : "meeting";
     const isSummaryTranslation = item.kind === "summary_translation";
     const isTranslation = item.kind === "translation";
     const isEnhanced = item.kind === "enhanced";
@@ -475,16 +533,16 @@ export default function App() {
     const hasSessionId = /^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(itemSessionId);
     transcriptSessionId.current = hasSessionId ? itemSessionId : item.kind === "transcript" ? item.id : "";
     const sessionItems = transcriptSessionId.current
-      ? savedTranscripts.filter((saved) => saved.id === transcriptSessionId.current || saved.id.startsWith(`enhanced:${transcriptSessionId.current}`) || saved.id.startsWith(`summary:${transcriptSessionId.current}`) || saved.id.startsWith(`notes:${transcriptSessionId.current}`) || saved.id.startsWith(`translation:${transcriptSessionId.current}:`) || saved.id.startsWith(`summary-translation:${transcriptSessionId.current}:`))
+      ? savedTranscripts.filter((saved) => saved.id === transcriptSessionId.current || saved.id.startsWith(`enhanced:${transcriptSessionId.current}`) || saved.id.startsWith(`summary:${transcriptSessionId.current}`) || saved.id.startsWith(`notes:${transcriptSessionId.current}`) || saved.id.startsWith(`study-notes:${transcriptSessionId.current}`) || saved.id.startsWith(`translation:${transcriptSessionId.current}:`) || saved.id.startsWith(`summary-translation:${transcriptSessionId.current}:`) || saved.id.startsWith(`notes-translation:${transcriptSessionId.current}:`))
       : [item];
     const originalItem = sessionItems.find((saved) => saved.kind === "transcript");
     const enhancedItem = sessionItems.find((saved) => saved.kind === "enhanced");
     const summaryItem = sessionItems.find((saved) => saved.kind === "summary");
-    const notesItem = sessionItems.find((saved) => saved.kind === "notes");
+    const notesItem = sessionItems.find((saved) => saved.kind === (requestedNotesStyle === "study" ? "study_notes" : "notes")) ?? sessionItems.find((saved) => saved.kind === "notes" || saved.kind === "study_notes");
     const originalText = originalItem?.text ?? (item.kind === "transcript" ? item.text : "");
     const enhancedText = enhancedItem?.text ?? (isEnhanced ? item.text : "");
     const summaryTextForSession = summaryItem?.text ?? (isSummary ? item.text : isSummaryTranslation ? "" : "");
-    const notesTextForSession = notesItem?.text ?? (isNotes ? item.text : "");
+    const notesTextForSession = notesItem?.text ?? (isNotes || isStudyNotes ? item.text : "");
     const transcriptTranslationItems = sessionItems.filter((saved) => saved.kind === "translation");
     const savedTranscriptTranslations = Object.fromEntries(transcriptTranslationItems.map((saved) => [saved.name.split(" → ").at(-1) ?? "Translation", saved.text]));
     const savedSummaryTranslationItems = sessionItems.filter((saved) => saved.kind === "summary_translation");
@@ -492,9 +550,10 @@ export default function App() {
       const language = saved.name.split(" → ").at(-1) ?? "Translation";
       return [`${language} · ${selectedSummaryTranslationModel?.name ?? "gpt-6-luna"}`, saved.text];
     }));
+    const savedNotesTranslations = Object.fromEntries(sessionItems.filter((saved) => saved.kind === "notes_translation" && saved.id.split(":")[2] === requestedNotesStyle).map((saved) => [saved.name.split(" → ").at(-1) ?? "Translation", saved.text]));
     const showingSummary = Boolean(summaryTextForSession) || isSummary || isSummaryTranslation;
-    const selectedTranslationLanguage = isTranslation ? item.name.split(" → ").at(-1) ?? "Original" : isSummaryTranslation ? item.name.split(" → ").at(-1) : undefined;
-    transcriptSessionName.current = item.name.replace(/ · (Summary|[^·]+)$/, "").replace(/\.txt$/, "");
+    const selectedTranslationLanguage = isTranslation || isSummaryTranslation || isNotesTranslation ? item.name.split(" → ").at(-1) ?? "Original" : undefined;
+    transcriptSessionName.current = (originalItem?.name ?? item.name).replace(/\.txt$/i, "");
     setTranscript(originalText || (isTranslation ? item.text : ""));
     setOriginalTranscript(originalText);
     setEnhancedTranscript(enhancedText);
@@ -510,6 +569,12 @@ export default function App() {
     summaryTextRef.current = summaryTextForSession;
     setNotesText(notesTextForSession);
     notesTextRef.current = notesTextForSession;
+    const loadedNotesStyle = notesItem?.kind === "study_notes" ? "study" : requestedNotesStyle;
+    setNotesStyle(loadedNotesStyle);
+    notesStyleRef.current = loadedNotesStyle;
+    setNotesTranslations(isNotesTranslation && !Object.keys(savedNotesTranslations).length
+      ? { [item.name.split(" → ").at(-1) ?? "Translation"]: item.text }
+      : savedNotesTranslations);
     setNotesMode(false);
     notesModeRef.current = false;
     setSummaryStatus(showingSummary ? "ended" : "idle");
@@ -523,7 +588,7 @@ export default function App() {
       translations: savedTranscriptTranslations,
       summaryTranslations: savedSummaryTranslations,
       questionMessages: [],
-      activeLanguage: isEnhanced ? "Enhanced" : isTranslation ? selectedTranslationLanguage ?? "Original" : "Original", completed: true, summaryMode: showingSummary, notesText: notesTextForSession, notesMode: false, summaryTranslationLive: false, translationEnabled: false,
+      activeLanguage: isEnhanced ? "Enhanced" : isTranslation ? selectedTranslationLanguage ?? "Original" : "Original", completed: true, summaryMode: showingSummary, notesText: notesTextForSession, notesMode: false, notesStyle: loadedNotesStyle, notesTranslations: savedNotesTranslations, summaryTranslationLive: false, translationEnabled: false,
       sessionId: transcriptSessionId.current, sessionName: transcriptSessionName.current,
     };
   }
@@ -616,6 +681,7 @@ export default function App() {
         previousNotes: summaryTextRef.current,
         newTranscript: addition,
         model: summaryModelRef.current,
+        noteStyle: "running_summary",
       });
       summaryTextRef.current = notes;
       setSummaryText(notes);
@@ -636,18 +702,61 @@ export default function App() {
     const addition = text.trim();
     if (!addition || !notesModeRef.current || (sourceModeRef.current !== "system" && !completedRef.current)) return;
     summaryQueue.current = summaryQueue.current.then(async () => {
-      const notes = await invoke<string>("update_summary_notes", { previousNotes: notesTextRef.current, newTranscript: addition, model: summaryModelRef.current });
+      const selectedNotesStyle = notesStyleRef.current;
+      const notes = await invoke<string>("update_summary_notes", { previousNotes: notesTextRef.current, newTranscript: addition, model: summaryModelRef.current, noteStyle: selectedNotesStyle });
       notesTextRef.current = notes;
       setNotesText(notes);
-      await invoke("save_transcript_notes", { sessionId: transcriptSessionId.current, name: transcriptSessionName.current, text: notes });
+      await invoke("save_transcript_notes", { sessionId: transcriptSessionId.current, name: transcriptSessionName.current, text: notes, noteStyle: selectedNotesStyle });
       await refreshSavedTranscripts();
     }).catch((cause) => setError(`Notes update failed: ${errorMessage(cause)}`));
   }
 
-  function startMeetingNotes() {
+  function startNotes() {
     setNotesMode(true);
     notesModeRef.current = true;
     if (transcriptRef.current.trim()) queueMeetingNotes(transcriptRef.current);
+  }
+
+  function chooseNotesStyle(style: "meeting" | "study") {
+    if (notesModeRef.current) return;
+    notesStyleRef.current = style;
+    setNotesStyle(style);
+    const prefix = style === "study" ? "study-notes:" : "notes:";
+    const savedNotes = savedTranscripts.find((item) => item.id === `${prefix}${transcriptSessionId.current}`);
+    notesTextRef.current = savedNotes?.text ?? "";
+    setNotesText(notesTextRef.current);
+    const translationPrefix = `notes-translation:${transcriptSessionId.current}:${style}:`;
+    setNotesTranslations(Object.fromEntries(savedTranscripts
+      .filter((item) => item.kind === "notes_translation" && item.id.startsWith(translationPrefix))
+      .map((item) => [item.name.split(" → ").at(-1) ?? "Translation", item.text])));
+  }
+
+  async function translateNotes() {
+    const language = targetLanguage === "Other" ? customLanguage.trim() : targetLanguage;
+    if (!notesText.trim() || !language || !selectedTranscriptTranslationModel || notesTranslating) return;
+    setNotesTranslating(true);
+    startTechnicalTask(`Notes translation ${language}`);
+    try {
+      const translated = await invoke<string>("translate_transcript", {
+        text: notesText,
+        targetLanguage: language,
+        model: transcriptTranslationModel,
+      });
+      setNotesTranslations((current) => ({ ...current, [language]: translated }));
+      await invoke("save_notes_translation", {
+        sessionId: transcriptSessionId.current,
+        sourceName: transcriptSessionName.current,
+        language,
+        text: translated,
+        noteStyle: notesStyleRef.current,
+      });
+      await refreshSavedTranscripts();
+    } catch (cause) {
+      setError(`Notes translation failed: ${errorMessage(cause)}`);
+      recordTechnicalLog("Notes translation", `Failed: ${errorMessage(cause)}`);
+    } finally {
+      setNotesTranslating(false);
+    }
   }
 
   async function generateFinalSummary(text: string) {
@@ -858,7 +967,12 @@ export default function App() {
 
     const unlistenEvent = listen<TranscriptionEvent>("transcription-progress", ({ payload }) => {
       if (payload.taskSlot === "system") {
-        if (payload.kind === "prompt") setTranscriptionPrompts((current) => ({ ...current, [payload.chunk ?? 0]: payload.prompt ?? null }));
+        if (payload.kind === "prompt") {
+          setTranscriptionPrompts((current) => ({ ...current, [payload.chunk ?? 0]: payload.prompt ?? null }));
+        } else if (payload.kind === "delta" && payload.chunk && payload.delta) {
+          systemStreamedParts.current[payload.chunk] = (systemStreamedParts.current[payload.chunk] ?? "") + payload.delta;
+          renderSystemTranscriptPreview();
+        }
         return;
       }
       if (payload.taskSlot !== "file" && payload.taskSlot !== "online") return;
@@ -985,6 +1099,7 @@ export default function App() {
 
     const unlistenTranslation = listen<TranslationEvent>("translation-progress", ({ payload }) => {
       if (payload.kind === "done") { recordTechnicalLog("Translation", `Completed ${payload.totalChunks} part(s).`); void refreshUsage(); }
+      if (payload.kind === "prompt_cache" && payload.cachedTokens) recordTechnicalLog("Prompt caching", `Used · ${payload.cachedTokens.toLocaleString()} cached input tokens (${payload.chunk}/${payload.totalChunks}).`);
       const language = translatingLanguage.current;
       if (payload.kind === "delta" && payload.delta && language) {
         if (language.startsWith("summary:")) {
@@ -1002,15 +1117,15 @@ export default function App() {
       if (sourceModeRef.current !== "system") {
         if (payload.kind === "transcript" && payload.text !== undefined) {
           const tab = transcriptTabs.current.system;
-          const next = `${tab.transcript}${tab.transcript ? "\n" : ""}${payload.text}`;
-          tab.transcript = next;
-          tab.originalTranscript = next;
+          const chunk = payload.chunk ?? payload.completedChunks;
+          commitSystemTranscriptChunk(chunk, payload.text, payload.completedChunks);
           const sessionId = tab.sessionId;
           const name = tab.sessionName;
-          if (sessionId) void invoke("replace_final_transcript", { sessionId, name, text: next }).then(refreshSavedTranscripts).catch((cause) => setError(`Background capture transcript save failed: ${errorMessage(cause)}`));
+          if (sessionId) void invoke("replace_final_transcript", { sessionId, name, text: systemCommittedTranscript.current }).then(refreshSavedTranscripts).catch((cause) => setError(`Background capture transcript save failed: ${errorMessage(cause)}`));
           return;
         }
         if (payload.kind === "done") {
+          systemCaptureFinalized.current = true;
           const tab = transcriptTabs.current.system;
           tab.completed = true;
           tab.summaryMode = false;
@@ -1024,6 +1139,8 @@ export default function App() {
         setSystemQueuedChunks(payload.queuedChunks);
         setSystemActiveRequests(payload.activeRequests);
       } else if (payload.kind === "capture_stopped") {
+        // A late capture-stop notification must not undo the terminal queue event.
+        if (systemCaptureFinalized.current) return;
         setSystemRecording(false);
         setSystemStopping(true);
         setSystemQueuedChunks(payload.queuedChunks);
@@ -1043,20 +1160,18 @@ export default function App() {
         setSystemWarning(payload.message ?? "A chunk was force-split without silence.");
       } else if (payload.kind === "transcript" && payload.text !== undefined) {
         recordTechnicalLog("Audio capture", `Part ${payload.completedChunks} transcribed; ${payload.queuedChunks} queued, ${payload.activeRequests} active.`);
-        const next = `${transcriptRef.current}${transcriptRef.current ? "\n" : ""}${payload.text}`;
-        transcriptRef.current = next;
-        setTranscript(next);
-        setOriginalTranscript(next);
-        persistTranscriptFragment(payload.chunk ?? systemCompletedChunks + 1, payload.text);
+        commitSystemTranscriptChunk(payload.chunk ?? payload.completedChunks, payload.text, payload.completedChunks);
+        transcriptRef.current = systemCommittedTranscript.current;
+        persistTranscriptFragment(payload.chunk ?? systemCompletedChunksRef.current, payload.text);
         snapshotTranscriptFile();
         queueRunningNotes(payload.text);
         queueMeetingNotes(payload.text);
-        setSystemCompletedChunks(payload.completedChunks);
         setSystemQueuedChunks(payload.queuedChunks);
       } else if (payload.kind === "error") {
         setError(`${payload.code ? `[${payload.code}] ` : ""}${payload.message ?? "System audio capture failed."}`);
         void transcriptPersistenceQueue.current.then(refreshSavedTranscripts);
       } else if (payload.kind === "done") {
+        systemCaptureFinalized.current = true;
         setSystemRecording(false);
         setSystemStopping(false);
         setCompleted(true);
@@ -1132,6 +1247,7 @@ export default function App() {
 
     const unlistenSummary = listen<SummaryEvent>("summary-progress", ({ payload }) => {
       if (payload.kind === "start" || payload.kind === "done") recordTechnicalLog("Summary", `${payload.mode} ${payload.kind}.`);
+      if (payload.kind === "prompt_cache" && payload.cachedTokens) recordTechnicalLog("Prompt caching", `Used · ${payload.cachedTokens.toLocaleString()} cached input tokens (${payload.mode}).`);
       if (payload.kind === "done") void refreshUsage();
       if (payload.mode === "question" && payload.kind === "delta" && payload.delta) {
         setQuestionDraft((current) => current + payload.delta);
@@ -1140,6 +1256,9 @@ export default function App() {
       }
     });
     const unlistenInputLevel = listen<number>("audio-input-level", ({ payload }) => setInputLevel(Math.max(0, Math.min(1, payload))));
+    const unlistenCaptureFormat = listen<{ source: string; sampleRate: number; channels: number; targetSampleRate: number; targetChannels: number; captureEncoding: string }>("audio-capture-format", ({ payload }) => {
+      recordTechnicalLog("Audio capture", `Microphone input: ${payload.sampleRate / 1000} kHz / ${payload.channels} ch → ${payload.targetSampleRate / 1000} kHz mono ${payload.captureEncoding}.`);
+    });
     const unlistenSavedCaptures = listen<string[]>("audio-recordings-saved", ({ payload }) => {
       const newestRecording = payload.at(-1);
       const recordingName = newestRecording?.split(/[\\/]/).pop();
@@ -1171,6 +1290,7 @@ export default function App() {
       void unlistenRealtime.then((fn) => fn());
       void unlistenSummary.then((fn) => fn());
       void unlistenInputLevel.then((fn) => fn());
+      void unlistenCaptureFormat.then((fn) => fn());
       void unlistenSavedCaptures.then((fn) => fn());
       void unlistenDrop.then((fn) => fn());
     };
@@ -1180,6 +1300,16 @@ export default function App() {
     if (sourceMode !== "system" || captureSource === "system") return;
     void refreshInputDevices();
   }, [sourceMode, captureSource]);
+
+  useEffect(() => {
+    if (!microphoneRateConstraint || availableCaptureQualities.length === 0 || availableCaptureQualities.includes(captureQuality)) return;
+    const currentRate = CAPTURE_QUALITY_PRESETS.find((preset) => preset.key === captureQuality)?.sampleRate ?? 0;
+    const fallback = [...availableCaptureQualities].reverse().find((key) => {
+      const rate = CAPTURE_QUALITY_PRESETS.find((preset) => preset.key === key)?.sampleRate ?? 0;
+      return rate <= currentRate;
+    }) ?? availableCaptureQualities[0];
+    setCaptureQuality(fallback);
+  }, [microphoneRateConstraint, availableCaptureQualities.join(","), captureQuality]);
 
   useEffect(() => {
     localStorage.setItem("transcription-model", model);
@@ -1197,6 +1327,14 @@ export default function App() {
   useEffect(() => { localStorage.setItem("question-model", questionModel); }, [questionModel]);
 
   useEffect(() => { localStorage.setItem("parallel-requests", String(parallelRequests)); }, [parallelRequests]);
+  useEffect(() => { localStorage.setItem("capture-quality", captureQuality); }, [captureQuality]);
+  useEffect(() => { localStorage.setItem("compact-enabled", String(compactEnabled)); }, [compactEnabled]);
+  useEffect(() => {
+    // Remove the legacy per-source settings so only the shared preference remains.
+    localStorage.removeItem("compact-microphone");
+    localStorage.removeItem("compact-online-download");
+  }, []);
+  useEffect(() => { localStorage.removeItem("recording-quality"); }, []);
   useEffect(() => { localStorage.setItem("technical-errors", String(technicalErrors)); }, [technicalErrors]);
   useEffect(() => {
     localStorage.setItem("technical-details", String(technicalDetails));
@@ -1248,9 +1386,8 @@ export default function App() {
   const selectedAudioTrack = audio?.audioTracks.find((track) => track.streamIndex === selectedAudioStreamIndex);
   const queuedDuration = audioOwner === "file" && audioQueue.length > 1 ? audioQueue.reduce((sum, item) => sum + item.durationSeconds, 0) : audio?.durationSeconds ?? 0;
   const queuedSize = audioOwner === "file" && audioQueue.length > 1 ? audioQueue.reduce((sum, item) => sum + item.sizeBytes, 0) : audio?.sizeBytes ?? 0;
-  const needsSplitting = queuedSize > MAX_BYTES || queuedDuration > TARGET_PART_SECONDS;
   const estimatedCost = audio && audioOwner === sourceMode ? estimateTranscriptionCost(model, queuedDuration) : 0;
-  const estimatedParts = audio && audioOwner === sourceMode ? estimatePartCount(queuedSize, queuedDuration, compressAudio) : 1;
+  const estimatedParts = audio && audioOwner === sourceMode ? estimatePartCount(queuedSize, queuedDuration, false) : 1;
   const displayedText = activeLanguage === "Original"
     ? originalTranscript || transcript
     : activeLanguage === "Enhanced"
@@ -1275,6 +1412,9 @@ export default function App() {
     ...Object.entries(translations).map(([language, text]) => ({ language, text })),
   ];
   const progressStyle = useMemo(() => ({ "--progress": `${progress}%` } as React.CSSProperties), [progress]);
+  const progressFinished = completed
+    || phase === "Media inspected · audio stream confirmed"
+    || phase === "Page inspected · choose a loaded audio or video source";
   const backgroundWorkActive = transcriptionBusyBySlot.file || transcriptionBusyBySlot.online || onlineExtracting || onlineInspecting || webPageInspecting || localImporting || systemRecording || liveRecording || systemStopping || liveStopping || translating || summaryTranslating || questionBusy || summaryGenerating || enhancementRunning;
   const onlineDownloadLabel = (() => {
     if (!onlineExtracting || !onlineDownloadProgress) return null;
@@ -1299,6 +1439,7 @@ export default function App() {
 
   async function inspectAudio(path: string, append = false): Promise<boolean> {
     setError("");
+    systemCaptureFinalized.current = captureMode !== "standard";
     if (!append) {
       setTranscript("");
       setOriginalTranscript("");
@@ -1309,7 +1450,7 @@ export default function App() {
       livePersistedTranscript.current = "";
       setSummaryText("");
       summaryTextRef.current = "";
-      setNotesText(""); notesTextRef.current = ""; setNotesMode(false); notesModeRef.current = false; setSummaryTranslationLive(false); summaryTranslationLiveRef.current = false;
+      setNotesText(""); notesTextRef.current = ""; setNotesMode(false); notesModeRef.current = false; notesStyleRef.current = "meeting"; setNotesStyle("meeting"); setNotesTranslations({}); setSummaryTranslationLive(false); summaryTranslationLiveRef.current = false;
       setSummaryDraft("");
       setSummaryStatus("idle");
       setSummaryTranslations({});
@@ -1407,8 +1548,44 @@ export default function App() {
     if (urlOverride) setOnlineUrl(url);
     startTechnicalTask(classifyOnlineUrl(url) === "web" ? "Web page inspection" : "Online media inspection");
     setError("");
+    setProgress(0);
+    setTranscriptionPrompts({});
+    if (audioOwner === "online") setAudio(null);
+    setTranscript("");
+    setOriginalTranscript("");
+    setEnhancedTranscript("");
+    transcriptRef.current = "";
+    transcriptParts.current = {};
+    completedParts.current.clear();
+    setSummaryText("");
+    summaryTextRef.current = "";
+    setSummaryDraft("");
+    setNotesText("");
+    notesTextRef.current = "";
+    setNotesMode(false);
+    notesModeRef.current = false;
+    setSummaryMode(false);
+    summaryModeRef.current = false;
+    setSummaryStatus("idle");
+    setTranslations({});
+    setTranslationEnabled(false);
+    setActiveLanguage("Original");
+    setSummaryTranslations({});
+    setNotesTranslations({});
+    setQuestionMessages([]);
+    setQuestionDraft("");
+    setCompleted(false);
+    transcriptSessionId.current = "";
+    transcriptSessionName.current = "Transcript";
     setTranscriptionContextPrompt("");
+    transcriptTabs.current.online = {
+      ...transcriptTabs.current.online,
+      transcript: "", originalTranscript: "", enhancedTranscript: "", summaryText: "", notesText: "",
+      translations: {}, summaryTranslations: {}, notesTranslations: {}, questionMessages: [], completed: false,
+      notesMode: false, summaryMode: false, translationEnabled: false, activeLanguage: "Original", sessionId: "", sessionName: "Transcript",
+    };
     setOnlineMedia(null);
+    setSelectedOnlineCaptionId("");
     setWebPageInfo(null);
     setOnlineInspecting(true);
     const kind = classifyOnlineUrl(url);
@@ -1420,13 +1597,21 @@ export default function App() {
         setWebPageInspecting(true);
         const info = await invoke<PageMediaInfo>("inspect_web_page", { url, headlessMode: headlessBrowser });
         setWebPageInfo(info);
+        setTranscriptionContextPrompt(info.pageTitle.trim() ? `Title: ${info.pageTitle.trim()}` : "");
         setOnlineInputKind("web");
+        setProgress(100);
         setPhase("Page inspected · choose a loaded audio or video source");
       } else {
         try {
           const media = await invoke<OnlineMediaInfo>("inspect_online_media", { url, headlessMode: headlessBrowser });
           setOnlineMedia(media);
+          setSelectedOnlineCaptionId(media.captions[0]?.id ?? "");
+          setTranscriptionContextPrompt([
+            media.title.trim() ? `Title: ${media.title.trim()}` : "",
+            media.description?.trim() ? `Description: ${media.description.trim().slice(0, 700)}` : "",
+          ].filter(Boolean).join("\n"));
           setOnlineKeepVideo(false);
+          setProgress(100);
           setPhase("Media inspected · audio stream confirmed");
         } catch (mediaCause) {
           // Unknown URLs may be watch pages or signed direct media URLs; try the private browser only as a fallback.
@@ -1436,7 +1621,9 @@ export default function App() {
           setPhase("Checking the page for media that is currently loaded");
           const info = await invoke<PageMediaInfo>("inspect_web_page", { url, headlessMode: headlessBrowser });
           setWebPageInfo(info);
+          setTranscriptionContextPrompt(info.pageTitle.trim() ? `Title: ${info.pageTitle.trim()}` : "");
           setOnlineInputKind("web");
+          setProgress(100);
           setPhase("Page inspected · choose a loaded audio or video source");
         }
       }
@@ -1468,6 +1655,71 @@ export default function App() {
     void inspectOnline(url);
   }
 
+  async function useSelectedOnlineCaption() {
+    const media = onlineMedia;
+    const caption = media?.captions.find((item) => item.id === selectedOnlineCaptionId);
+    if (!media || !caption || onlineCaptionLoading || onlineExtracting || transcriptionBusyBySlot.online) return;
+    setError("");
+    setOnlineCaptionLoading(true);
+    setProgress(8);
+    setPhase(`Loading ${caption.label}`);
+    startTechnicalTask("Online caption transcript");
+    recordTechnicalLog("Caption", `Using ${caption.label} as the transcript source.`);
+    try {
+      const text = await invoke<string>("download_online_caption", {
+        url: media.url,
+        language: caption.language,
+        automatic: caption.automatic,
+      });
+      if (!text.trim()) throw new Error("The selected caption contained no transcript text.");
+      const name = media.filenameTitle ?? media.title;
+      const sessionId = startTranscriptSession(name);
+      setTranscript(text);
+      setOriginalTranscript(text);
+      setEnhancedTranscript("");
+      transcriptRef.current = text;
+      setSummaryText("");
+      summaryTextRef.current = "";
+      setNotesText("");
+      notesTextRef.current = "";
+      setCompleted(true);
+      setActiveLanguage("Original");
+      setTranslations({});
+      setTranslationEnabled(false);
+      transcriptTabs.current.online = {
+        ...transcriptTabs.current.online,
+        transcript: text,
+        originalTranscript: text,
+        enhancedTranscript: "",
+        summaryText: "",
+        notesText: "",
+        translations: {},
+        summaryTranslations: {},
+        notesTranslations: {},
+        questionMessages: [],
+        activeLanguage: "Original",
+        completed: true,
+        summaryMode: false,
+        translationEnabled: false,
+        sessionId,
+        sessionName: name,
+      };
+      await invoke("replace_final_transcript", { sessionId, name, text });
+      await refreshSavedTranscripts();
+      setProgress(100);
+      setPhase(`Caption transcript ready · ${caption.label}`);
+      recordTechnicalLog("Caption", `Transcript saved to Library · ${text.length.toLocaleString()} characters.`);
+    } catch (cause) {
+      const message = errorMessage(cause);
+      setError(`Could not use the selected caption: ${message}`);
+      setProgress(0);
+      setPhase("Caption transcript could not be created");
+      recordTechnicalLog("Caption", `Failed: ${message}`);
+    } finally {
+      setOnlineCaptionLoading(false);
+    }
+  }
+
   async function extractOnlineAudio(_allowReencode = false, downloadApproved = false) {
     if (!onlineMedia || onlineExtracting || transcriptionBusyBySlot.online) return;
     if (!downloadApproved) {
@@ -1481,6 +1733,7 @@ export default function App() {
     setOnlineDownloadProgress(null);
     lastLoggedDownloadProgress.current = { stage: "", bytes: 0, partMark: -1, percentMark: -1 };
     recordTechnicalLog("Download", `Source: ${onlineMedia.title}`);
+    recordTechnicalLog("Download", "Preserving the selected source audio codec without re-encoding.");
     setOnlineExtracting(true);
     setProgress(2);
     setPhase("Preparing the download");
@@ -1499,7 +1752,7 @@ export default function App() {
       transcriptRef.current = "";
       setSummaryText("");
       summaryTextRef.current = "";
-      setNotesText(""); notesTextRef.current = ""; setNotesMode(false); notesModeRef.current = false; setSummaryTranslationLive(false); summaryTranslationLiveRef.current = false;
+      setNotesText(""); notesTextRef.current = ""; setNotesMode(false); notesModeRef.current = false; notesStyleRef.current = "meeting"; setNotesStyle("meeting"); setNotesTranslations({}); setSummaryTranslationLive(false); summaryTranslationLiveRef.current = false;
       setSummaryDraft("");
       transcriptParts.current = {};
       completedParts.current.clear();
@@ -1510,6 +1763,7 @@ export default function App() {
       setProgress(0);
       setPhase("Audio saved in app storage · ready to transcribe");
       setOnlineMedia(null);
+      setSelectedOnlineCaptionId("");
     } catch (cause) {
       const message = onlineErrorMessage(cause);
       if (message.includes("canceled")) {
@@ -1542,6 +1796,9 @@ export default function App() {
   }
 
   async function refreshInputDevices() {
+    if (inputDevicesLoading) return;
+    const startedAt = performance.now();
+    setInputDevicesLoading(true);
     try {
       const devices = await invoke<InputDevice[]>("list_audio_input_devices");
       setInputDevices(devices);
@@ -1549,6 +1806,12 @@ export default function App() {
     } catch (cause) {
       setInputDevices([]);
       setError(errorMessage(cause));
+    } finally {
+      const remainingRotationMs = Math.max(0, 1000 - (performance.now() - startedAt));
+      if (remainingRotationMs > 0) {
+        await new Promise((resolve) => window.setTimeout(resolve, remainingRotationMs));
+      }
+      setInputDevicesLoading(false);
     }
   }
 
@@ -1592,7 +1855,7 @@ export default function App() {
     transcriptRef.current = "";
     setSummaryText("");
     summaryTextRef.current = "";
-    setNotesText(""); notesTextRef.current = ""; setNotesMode(false); notesModeRef.current = false; setSummaryTranslationLive(false); summaryTranslationLiveRef.current = false;
+    setNotesText(""); notesTextRef.current = ""; setNotesMode(false); notesModeRef.current = false; notesStyleRef.current = "meeting"; setNotesStyle("meeting"); setNotesTranslations({}); setSummaryTranslationLive(false); summaryTranslationLiveRef.current = false;
     setSummaryDraft("");
     setSummaryStatus(summaryModeRef.current ? "started" : "idle");
     setSummaryTranslations({});
@@ -1607,7 +1870,7 @@ export default function App() {
     const sessionId = startTranscriptSession(sessionName);
     const task = { id: taskId, sessionId, sessionName, chunkOffset: 0, totalChunks: 0, fileIndex: 1, fileCount: sources.length, active: true, parts: {} as Record<number, string>, complete: new Set<number>(), attempts: {} as Record<number, number>, persistence: Promise.resolve(), phase: "Starting transcription", progress: 4, error: "" };
     transcriptionTasks.current[taskSlot] = task;
-    Object.assign(transcriptTabs.current[taskSlot], { transcript: "", originalTranscript: "", enhancedTranscript: "", summaryText: "", notesText: "", translations: {}, summaryTranslations: {}, questionMessages: [], activeLanguage: "Original", completed: false, summaryMode: false, notesMode: false, sessionId, sessionName });
+    Object.assign(transcriptTabs.current[taskSlot], { transcript: "", originalTranscript: "", enhancedTranscript: "", summaryText: "", notesText: "", notesMode: false, notesStyle: "meeting", notesTranslations: {}, translations: {}, summaryTranslations: {}, questionMessages: [], activeLanguage: "Original", completed: false, summaryMode: false, sessionId, sessionName });
     transcriptionChunkOffset.current = 0;
     currentTranscriptionTotal.current = 0;
     batchTranscriptionActive.current = sources.length > 1;
@@ -1623,7 +1886,8 @@ export default function App() {
         setPhase(sources.length > 1 ? `Starting file ${index + 1} of ${sources.length}` : "Starting transcription");
         const request: TranscribeRequest = {
           path: source.path,
-          compressAudio,
+          compressAudio: false,
+          audioQuality: captureQuality,
           audioStreamIndex: source.path === audio.path ? selectedAudioStreamIndex : (source.audioTracks[0]?.streamIndex ?? 0),
           allowReencode,
           model,
@@ -1728,6 +1992,10 @@ export default function App() {
   }
 
   async function startSystemAudio() {
+    if (microphoneRateConstraint && !availableCaptureQualities.includes(captureQuality)) {
+      setError("The selected microphone does not support a high enough sample rate for this quality. Choose a listed quality or select another microphone.");
+      return;
+    }
     if (captureMode === "standard" && !selectedSystemModel) return;
     if (captureMode === "live" && !liveModelAvailable) return;
     if ((captureSource === "microphone" || captureSource === "both") && !selectedInputDevice) {
@@ -1742,7 +2010,7 @@ export default function App() {
     liveFinalTranscript.current = "";
     setSummaryText("");
     summaryTextRef.current = "";
-    setNotesText(""); notesTextRef.current = ""; setNotesMode(false); notesModeRef.current = false; setSummaryTranslationLive(false); summaryTranslationLiveRef.current = false;
+    setNotesText(""); notesTextRef.current = ""; setNotesMode(false); notesModeRef.current = false; notesStyleRef.current = "meeting"; setNotesStyle("meeting"); setNotesTranslations({}); setSummaryTranslationLive(false); summaryTranslationLiveRef.current = false;
     setSummaryDraft("");
     setTranslations({});
     setTranslationEnabled(false);
@@ -1752,6 +2020,11 @@ export default function App() {
     setSystemChunkElapsed(0);
     setSystemForceRemaining(150);
     setSystemCompletedChunks(0);
+    systemCommittedTranscript.current = "";
+    systemCompletedChunksRef.current = 0;
+    systemStreamedParts.current = {};
+    transcriptTabs.current.system.transcript = "";
+    transcriptTabs.current.system.originalTranscript = "";
     setSystemQueuedChunks(0);
     setSystemActiveRequests(0);
     setSystemEstimatedCost(0);
@@ -1762,15 +2035,23 @@ export default function App() {
     setInputLevel(0);
     startTranscriptSession(captureSource === "both" ? "System Audio + Microphone" : captureSource === "system" ? "System Audio" : "Microphone");
     setPhase(captureMode === "live" ? "Starting live transcription" : "Starting audio capture");
+    const capturePreset = CAPTURE_QUALITY_PRESETS.find((preset) => preset.key === captureQuality)!;
+    const { sampleRate: captureRate, bitrate: captureBitrate, label: captureLabel } = capturePreset;
+    const compactApplies = compactEnabled;
+    recordTechnicalLog(captureMode === "live" ? "Live audio" : "Audio capture", compactApplies
+      ? `Selected quality: ${captureLabel} · mono AAC · ${captureRate / 1000} kHz / ${captureBitrate} kbps; encoded during capture.`
+      : `Selected quality: ${captureLabel} · mono PCM/WAV · ${captureRate / 1000} kHz; Compact is off.`);
+    if (captureMode === "live") recordTechnicalLog("Live audio", "OpenAI Realtime input: 24 kHz · 16-bit · mono PCM; saved recording keeps the selected capture quality.");
     if (captureMode === "standard") setSystemRecording(true);
     else setLiveRecording(true);
     try {
       if (captureMode === "standard") {
-        await invoke("start_system_audio", { model: systemModel, source: captureSource, inputDevice: captureSource !== "system" ? selectedInputDevice : null, parallelRequests });
+        await invoke("start_system_audio", { model: systemModel, source: captureSource, inputDevice: captureSource !== "system" ? selectedInputDevice : null, parallelRequests, quality: captureQuality, compactMicrophone: compactEnabled, compactSystemAudio: compactEnabled });
       } else {
-        await invoke("start_realtime_audio", { source: captureSource, inputDevice: captureSource !== "system" ? selectedInputDevice : null });
+        await invoke("start_realtime_audio", { source: captureSource, inputDevice: captureSource !== "system" ? selectedInputDevice : null, quality: captureQuality, compactMicrophone: compactEnabled, compactSystemAudio: compactEnabled });
       }
     } catch (cause) {
+      systemCaptureFinalized.current = true;
       recordTechnicalLog("Audio capture", `Start failed: ${errorMessage(cause)}`);
       setSystemRecording(false);
       setLiveRecording(false);
@@ -1889,7 +2170,7 @@ export default function App() {
     liveFinalTranscript.current = "";
     setSummaryText("");
     summaryTextRef.current = "";
-    setNotesText(""); notesTextRef.current = ""; setNotesMode(false); notesModeRef.current = false; setSummaryTranslationLive(false); summaryTranslationLiveRef.current = false;
+    setNotesText(""); notesTextRef.current = ""; setNotesMode(false); notesModeRef.current = false; notesStyleRef.current = "meeting"; setNotesStyle("meeting"); setNotesTranslations({}); setSummaryTranslationLive(false); summaryTranslationLiveRef.current = false;
     setSummaryDraft("");
     setSummaryStatus("idle");
     setSummaryTranslations({});
@@ -2030,17 +2311,6 @@ export default function App() {
               </div>
             )}
 
-            <div className="option-card card">
-              <div className="option-heading">
-                <span className="option-icon"><Sparkles size={18} /></span>
-                <div><strong>Compress audio</strong><p>Convert to AAC · 64 kbps · 16 kHz · mono</p></div>
-                <button className={`toggle ${compressAudio ? "on" : ""}`} onClick={() => setCompressAudio((value) => !value)} role="switch" aria-checked={compressAudio} disabled={busy}><i /></button>
-              </div>
-              <div className="spec-row">
-                {compressAudio ? <><span>Compression enabled</span><em>Will convert audio</em></> : <><span>Original quality preserved</span><em>{needsSplitting ? "Will split at silence" : "No conversion"}</em></>}
-              </div>
-            </div>
-
             {audio && audioOwner === "file" && <div className="transcription-prompt-card card">
               <label htmlFor="transcription-context-prompt"><div className="section-label"><FileText size={15} /><span>Transcription prompt context</span></div></label>
               <p>Optional context sent with each audio part. YouTube title and description are prefilled when available; edit them or add your own terms.</p>
@@ -2057,9 +2327,20 @@ export default function App() {
             </> : sourceMode === "online" ? <>
               {onlineMedia && <div className="online-media-card card">
                 <div className="system-audio-heading"><span className="system-audio-icon"><AudioLines size={21} /></span><div><p>{onlineMedia.sourceKind}</p><h3>{onlineMedia.title}</h3></div><span className="standard-badge"><i />AUDIO FOUND</span></div>
-                {onlineMedia.availableFormats.length > 1 && <label className="online-quality-select"><span>Audio quality</span><select value={onlineMedia.formatId} onChange={(event) => selectOnlineFormat(event.target.value)} disabled={onlineExtracting || transcriptionBusyBySlot.online}>{onlineMedia.availableFormats.map((format) => <option value={format.formatId} key={format.formatId}>{format.recommended ? `Best audio quality (recommended) · ${format.formatLabel}` : format.formatLabel}</option>)}</select><small>Best audio quality chooses the highest available audio bitrate and sample rate. Audio-only formats avoid downloading video; video-containing formats are temporary and only their audio is kept.</small></label>}
+                {onlineMedia.captions.length > 0 && <div className="online-quality-select caption-picker">
+                  <span>Captions found · {onlineMedia.captions.length} available</span>
+                  <p>Captions are available. Select one to use as the transcript—no request to the Transcriptions API is needed.</p>
+                  <select value={selectedOnlineCaptionId} onChange={(event) => setSelectedOnlineCaptionId(event.target.value)} disabled={onlineCaptionLoading || onlineExtracting || transcriptionBusyBySlot.online}>
+                    {onlineMedia.captions.map((caption) => <option key={caption.id} value={caption.id}>{caption.label}</option>)}
+                  </select>
+                  <button className="primary-button transcribe-button" onClick={() => void useSelectedOnlineCaption()} disabled={!selectedOnlineCaptionId || onlineCaptionLoading || onlineExtracting || transcriptionBusyBySlot.online}>
+                    {onlineCaptionLoading ? <Loader2 className="spin" size={18} /> : <FileText size={18} />}
+                    {onlineCaptionLoading ? "Loading caption…" : "Use selected caption as transcript"}
+                  </button>
+                </div>}
+                {(onlineMedia.availableFormats.length > 1 || onlineMedia.sourceKind.toLowerCase().includes("hls")) && <label className="online-quality-select"><span>{onlineMedia.sourceKind.toLowerCase().includes("hls") ? "HLS audio stream" : "Audio quality"}</span><select value={onlineMedia.formatId} onChange={(event) => selectOnlineFormat(event.target.value)} disabled={onlineExtracting || transcriptionBusyBySlot.online}>{onlineMedia.availableFormats.map((format) => <option value={format.formatId} key={format.formatId}>{format.recommended ? `Best audio quality (recommended) · ${format.formatLabel}` : format.formatLabel}</option>)}</select><small>Choose the playlist stream to download. Best audio quality prefers the highest available bitrate and sample rate. Audio-only streams avoid downloading video.</small></label>}
                 <div className="online-format"><small>SELECTED FORMAT</small><strong>{onlineMedia.formatLabel}</strong><span>{onlineMedia.audioOnly ? "Audio-only stream · no video download" : "Audio and video stream · video will be temporary"}</span></div>
-                <p className="online-quality-note">Minefia keeps the original audio quality and does not re-encode the downloaded audio.</p>
+                <p className="online-quality-note">The selected stream is saved in its original audio format without re-encoding.</p>
                 {onlineMedia.hasVideo && <label className="keep-video-option"><input type="checkbox" checked={onlineKeepVideo} onChange={(event) => setOnlineKeepVideo(event.target.checked)} disabled={onlineExtracting || transcriptionBusyBySlot.online} /><span><strong>Keep downloaded video in app storage</strong><small>Off by default. The temporary video is removed after audio extraction.</small></span></label>}
                 <button className="primary-button transcribe-button" onClick={() => void extractOnlineAudio()} disabled={onlineExtracting || transcriptionBusyBySlot.online}>{onlineExtracting ? <Loader2 className="spin" size={18} /> : <AudioLines size={18} />}{onlineCancelRequested ? "Canceling…" : onlineExtracting ? "Extracting audio…" : "Extract audio"}{!onlineExtracting && <ArrowRight size={18} />}</button>
                 {onlineExtracting && <button className="online-cancel-button" onClick={() => void cancelOnlineExtraction()} disabled={onlineCancelRequested}>{onlineCancelRequested ? "Cancel requested" : "Cancel extraction"}</button>}
@@ -2116,14 +2397,16 @@ export default function App() {
                 <button className={captureMode === "standard" ? "selected" : ""} onClick={() => setCaptureMode("standard")} disabled={systemRecording || liveRecording}>Standard Mode</button>
                 <button className={captureMode === "live" ? "selected" : ""} onClick={() => setCaptureMode("live")} disabled={systemRecording || liveRecording}>Live Mode</button>
               </div>
-              <p className="capture-storage-note">New microphone and system-audio recordings are saved in Minefia Audio’s app storage.</p>
+              <p className="capture-storage-note">New microphone and system-audio recordings are saved in Minefia Audio’s app storage. Shared Compact is {compactEnabled ? `on · mono AAC at the selected ${captureQuality} quality` : "off · uncompressed mono WAV at the selected sample rate"}.</p>
               {captureMode === "live" && <p className="capture-storage-note">Speaker labels are not available in Live Mode. Choose Standard Mode and GPT-4o Transcribe Diarize to identify speakers.</p>}
 
               {(captureSource === "microphone" || captureSource === "both") && <div className="mic-device-card card">
                 <label><span>Input device</span><select value={selectedInputDevice} onChange={(event) => setSelectedInputDevice(event.target.value)} disabled={systemRecording || liveRecording || inputDevices.length === 0}>
-                  {inputDevices.length === 0 ? <option value="">No microphone detected</option> : inputDevices.map((device) => <option key={device.id} value={device.id}>{device.name}</option>)}
+                  {inputDevices.length === 0 ? <option value="">No microphone detected</option> : inputDevices.map((device) => <option key={device.id} value={device.id}>{device.name} · {device.supportedSampleRates.length ? device.supportedSampleRates.map((rate) => `${rate / 1000} kHz`).join("/") : `default ${device.defaultSampleRate ? `${device.defaultSampleRate / 1000} kHz` : "rate"}`} · {device.supportedChannels.length ? device.supportedChannels.map((channels) => `${channels} ch`).join("/") : `${device.defaultChannels ?? "?"} ch`}</option>)}
                 </select></label>
-                <div className="device-state"><i className={inputDevices.some((device) => device.id === selectedInputDevice) ? "connected" : ""} />{inputDevices.some((device) => device.id === selectedInputDevice) ? "Device available" : "Device disconnected"}<button onClick={() => void refreshInputDevices()} disabled={systemRecording || liveRecording} aria-label="Refresh input devices"><RefreshCw size={13} /></button></div>
+                <div className="device-state"><i className={inputDevices.some((device) => device.id === selectedInputDevice) ? "connected" : ""} />{inputDevices.some((device) => device.id === selectedInputDevice) ? "Device available" : "Device disconnected"}<span className={`compact-state ${compactEnabled ? "enabled" : "disabled"}`}><i />Capture Compact {compactEnabled ? "on" : "off"}</span><button onClick={() => void refreshInputDevices()} disabled={systemRecording || liveRecording || inputDevicesLoading} aria-label="Refresh input devices" aria-busy={inputDevicesLoading}><RefreshCw className={inputDevicesLoading ? "spin" : undefined} size={13} /></button></div>
+                {(() => { const device = inputDevices.find((item) => item.id === selectedInputDevice); return device ? <small>Available formats: {device.supportedSampleRates.length ? device.supportedSampleRates.map((rate) => `${rate / 1000} kHz`).join(", ") : `device default ${device.defaultSampleRate ? `${device.defaultSampleRate / 1000} kHz` : "rate"}`}; {device.supportedChannels.length ? device.supportedChannels.map((channels) => `${channels} channel${channels === 1 ? "" : "s"}`).join(", ") : `default ${device.defaultChannels ?? "unknown"} channels`}. PCM mode uses only a supported preset rate; Compact AAC may resample.</small> : null; })()}
+                <small>{compactEnabled ? `Microphone Compact is on in Settings: microphone audio uses mono AAC at the ${captureQuality} preset.` : `Microphone Compact is off in Settings: microphone audio is saved as uncompressed mono WAV at the selected ${captureQuality} sample rate.`}</small>
                 <div className="input-level-meter" aria-label={`Input level ${Math.round(inputLevel * 100)} percent`}><i style={{ width: `${Math.round(inputLevel * 100)}%` }} /></div>
                 <small>Recording begins only after you press Start.</small>
               </div>}
@@ -2180,7 +2463,7 @@ export default function App() {
                 <p className="estimate-note">Duration-based estimate. Live transcription is priced by audio usage; actual billing may vary.</p>
               </div>}
 
-              <button className={`primary-button transcribe-button ${(systemRecording || liveRecording) ? "stop-recording" : ""}`} onClick={systemRecording || liveRecording ? stopSystemAudio : startSystemAudio} disabled={(captureMode === "standard" ? !selectedSystemModel : !liveModelAvailable) || (captureSource !== "system" && !selectedInputDevice) || systemStopping || liveStopping}>
+              <button className={`primary-button transcribe-button ${(systemRecording || liveRecording) ? "stop-recording" : ""}`} onClick={systemRecording || liveRecording ? stopSystemAudio : startSystemAudio} disabled={(captureMode === "standard" ? !selectedSystemModel : !liveModelAvailable) || (captureSource !== "system" && !selectedInputDevice) || (microphoneRateConstraint && availableCaptureQualities.length === 0) || systemStopping || liveStopping}>
                 {systemStopping || liveStopping ? <Loader2 className="spin" size={19} /> : systemRecording || liveRecording ? <span className="stop-square" /> : <Radio size={19} />}
                 {systemStopping ? "Finishing queued audio…" : liveStopping ? "Finalizing transcript…" : systemRecording || liveRecording ? "Stop recording" : "Start recording"}
                 {!systemRecording && !liveRecording && !systemStopping && !liveStopping && <ArrowRight size={18} />}
@@ -2211,7 +2494,7 @@ export default function App() {
 
             {(busy || onlineExtracting || systemRecording || liveRecording || systemStopping || liveStopping || progress > 0) && (
               <div className="progress-panel">
-                <div className="progress-copy"><span>{completed ? <Check size={15} /> : <Loader2 className={(busy || onlineExtracting || systemRecording || liveRecording || systemStopping || liveStopping) ? "spin" : ""} size={15} />}{phase}</span><strong>{onlineDownloadLabel ?? (liveRecording ? formatDuration(liveElapsed) : `${Math.round(progress)}%`)}</strong></div>
+                <div className="progress-copy"><span>{progressFinished ? <Check size={15} /> : <Loader2 className={(busy || onlineExtracting || systemRecording || liveRecording || systemStopping || liveStopping || onlineInspecting || webPageInspecting) ? "spin" : ""} size={15} />}{phase}</span><strong>{onlineDownloadLabel ?? (liveRecording ? formatDuration(liveElapsed) : `${Math.round(progress)}%`)}</strong></div>
                 <div className={`progress-track ${onlineDownloadIndeterminate ? "indeterminate" : ""}`} style={progressStyle}><i /></div>
               </div>
             )}
@@ -2291,12 +2574,30 @@ export default function App() {
               </details>
             )}
 
-            {(sourceMode === "system" || completed) && (completed || systemRecording || liveRecording || notesText || Boolean(audio && audioOwner === sourceMode)) && <details className="summary-panel notes-panel" open>
-              <summary className="summary-panel-heading"><div><p className="eyebrow">MARKDOWN · INCREMENTAL NOTES</p><h3>Meeting / class notes</h3></div>{notesMode && <span className="summary-status-pill started"><Loader2 className="spin" size={13} /> Notes active</span>}</summary>
+            {(sourceMode === "system" || completed) && (completed || systemRecording || liveRecording || notesText || Object.keys(notesTranslations).length > 0 || Boolean(audio && audioOwner === sourceMode)) && <details className="summary-panel notes-panel" open>
+              <summary className="summary-panel-heading"><div><p className="eyebrow">MARKDOWN · INCREMENTAL NOTES</p><h3>{notesStyle === "study" ? "Cornell study notes" : "Meeting minutes"}</h3></div>{notesMode && <span className="summary-status-pill started"><Loader2 className="spin" size={13} /> Notes active</span>}</summary>
               <div className="summary-panel-content">
-                {!notesMode && <button className="summary-start-button" onClick={startMeetingNotes} disabled={!selectedTranslationModel}>Start notes</button>}
+                {!notesMode && <>
+                  <div className="notes-style-options" role="group" aria-label="Notes format">
+                    <button className={notesStyle === "meeting" ? "selected" : ""} onClick={() => chooseNotesStyle("meeting")}>Meeting minutes</button>
+                    <button className={notesStyle === "study" ? "selected" : ""} onClick={() => chooseNotesStyle("study")}>Cornell study notes</button>
+                  </div>
+                  <button className="summary-start-button" onClick={startNotes} disabled={!selectedTranslationModel}>Start {notesStyle === "study" ? "study notes" : "meeting minutes"}</button>
+                </>}
                 <p className="model-settings-hint">Notes model: {selectedTranslationModel?.name ?? translationModel} · Change in Settings</p>
-                {notesText ? <MarkdownSummary text={notesText} /> : <p className="summary-empty">Notes are appended and refined as transcript sections arrive. Works with recording, local files, and online media.</p>}
+                {notesText ? <MarkdownSummary text={notesText} /> : <p className="summary-empty">{notesStyle === "study" ? "Cornell-style notes preserve lecture detail and add key questions, a summary, and review questions." : "Meeting minutes keep discussion context, decisions, open questions, and action items."} Start notes after transcription is complete, or during recording.</p>}
+                {notesText && <div className="summary-translation-tools notes-translation-tools">
+                  <div className="section-label"><Languages size={14} /><span>Translate notes</span></div>
+                  <p className="model-settings-hint">Translation model: {selectedTranscriptTranslationModel?.name ?? transcriptTranslationModel} · Change in Settings</p>
+                  <div className="translation-actions">
+                    <select value={targetLanguage} onChange={(event) => setTargetLanguage(event.target.value)} disabled={notesTranslating} aria-label="Notes target language">
+                      {TRANSLATION_LANGUAGES.map((language) => <option key={language}>{language}</option>)}<option value="Other">Other language…</option>
+                    </select>
+                    <button onClick={() => void translateNotes()} disabled={notesTranslating || !selectedTranscriptTranslationModel || (targetLanguage === "Other" && !customLanguage.trim())}>{notesTranslating ? <><Loader2 className="spin" size={13} /> Translating…</> : notesTranslations[requestedTargetLanguage] ? "Translate again" : "Translate notes"}</button>
+                  </div>
+                  {targetLanguage === "Other" && <input className="custom-language" value={customLanguage} onChange={(event) => setCustomLanguage(event.target.value)} placeholder="Enter a language" maxLength={60} disabled={notesTranslating} />}
+                  {notesTranslations[requestedTargetLanguage] && <div className="summary-translated"><strong>{requestedTargetLanguage}</strong><MarkdownSummary text={notesTranslations[requestedTargetLanguage]} /></div>}
+                </div>}
               </div>
             </details>}
 
@@ -2362,7 +2663,7 @@ export default function App() {
         {error && <div className="error-toast"><CircleAlert size={18} /><span>{error}</span><button onClick={() => setError("")}><X size={16} /></button></div>}
       </main>
 
-      <SettingsModal open={settingsOpen} keys={apiKeys} adminKeys={adminApiKeys} onClose={() => setSettingsOpen(false)} onChanged={refreshSettingsKeys} parallelRequests={parallelRequests} onParallelRequestsChange={setParallelRequests} technicalErrors={technicalErrors} onTechnicalErrorsChange={setTechnicalErrors} technicalDetails={technicalDetails} onTechnicalDetailsChange={setTechnicalDetails} headlessBrowser={headlessBrowser} onHeadlessBrowserChange={setHeadlessBrowser} translationModels={availableTranslationModels} summaryModel={translationModel} onSummaryModelChange={setTranslationModel} transcriptTranslationModel={transcriptTranslationModel} onTranscriptTranslationModelChange={setTranscriptTranslationModel} summaryTranslationModel={summaryTranslationModel} onSummaryTranslationModelChange={setSummaryTranslationModel} questionModel={questionModel} onQuestionModelChange={setQuestionModel} />
+      <SettingsModal open={settingsOpen} keys={apiKeys} adminKeys={adminApiKeys} onClose={() => setSettingsOpen(false)} onChanged={refreshSettingsKeys} parallelRequests={parallelRequests} onParallelRequestsChange={setParallelRequests} captureQuality={captureQuality} onCaptureQualityChange={setCaptureQuality} availableCaptureQualities={availableCaptureQualities} captureQualityRestrictionNote={captureQualityRestrictionNote} compactEnabled={compactEnabled} onCompactEnabledChange={setCompactEnabled} technicalErrors={technicalErrors} onTechnicalErrorsChange={setTechnicalErrors} technicalDetails={technicalDetails} onTechnicalDetailsChange={setTechnicalDetails} headlessBrowser={headlessBrowser} onHeadlessBrowserChange={setHeadlessBrowser} translationModels={availableTranslationModels} summaryModel={translationModel} onSummaryModelChange={setTranslationModel} transcriptTranslationModel={transcriptTranslationModel} onTranscriptTranslationModelChange={setTranscriptTranslationModel} summaryTranslationModel={summaryTranslationModel} onSummaryTranslationModelChange={setSummaryTranslationModel} questionModel={questionModel} onQuestionModelChange={setQuestionModel} />
       <LibraryModal
         open={libraryOpen}
         files={libraryFiles}

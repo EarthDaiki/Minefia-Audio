@@ -27,6 +27,8 @@ use tauri::Manager;
 struct TranscribeRequest {
     path: String,
     compress_audio: bool,
+    #[serde(default = "transcription::default_audio_quality")]
+    audio_quality: String,
     audio_stream_index: u32,
     allow_reencode: bool,
     model: String,
@@ -74,6 +76,17 @@ async fn inspect_online_media(
     headless_mode: bool,
 ) -> Result<online_media::OnlineMediaInfo, errors::AppError> {
     online_media::inspect(&app, &url, headless_mode)
+        .await
+        .map_err(errors::classify)
+}
+
+#[tauri::command]
+async fn download_online_caption(
+    url: String,
+    language: String,
+    automatic: bool,
+) -> Result<String, errors::AppError> {
+    online_media::download_caption(&url, &language, automatic)
         .await
         .map_err(errors::classify)
 }
@@ -214,8 +227,9 @@ async fn save_transcript_notes(
     session_id: String,
     name: String,
     text: String,
+    note_style: String,
 ) -> Result<(), errors::AppError> {
-    transcript_store::save_notes(&app, &session_id, &name, &text)
+    transcript_store::save_notes(&app, &session_id, &name, &text, &note_style)
         .await
         .map_err(errors::classify)
 }
@@ -230,11 +244,13 @@ async fn fetch_project_costs(
         ));
     }
     let api_key = admin_credentials::load_selected(&app).map_err(errors::classify)?;
-    let project = app_project::get(&app).map_err(errors::classify)?;
-    let project_id = project
-        .project_id
-        .ok_or_else(|| errors::classify("No Minefia Audio Project is selected."))?;
-    usage::fetch(&api_key, &project_id)
+    let project_ids = app_project::usage_project_ids(&app).map_err(errors::classify)?;
+    if project_ids.is_empty() {
+        return Err(errors::classify(
+            "No Minefia Audio Service Account project is linked.",
+        ));
+    }
+    usage::fetch(&api_key, &project_ids)
         .await
         .map_err(errors::classify)
 }
@@ -260,8 +276,10 @@ async fn save_admin_api_key(
 }
 
 #[tauri::command]
-fn get_minefia_project(app: tauri::AppHandle) -> Result<app_project::AppProject, errors::AppError> {
-    app_project::get(&app).map_err(errors::classify)
+fn get_minefia_projects(
+    app: tauri::AppHandle,
+) -> Result<Vec<app_project::MinefiaProject>, errors::AppError> {
+    app_project::list(&app).map_err(errors::classify)
 }
 
 #[tauri::command]
@@ -275,15 +293,6 @@ async fn list_openai_projects(
 }
 
 #[tauri::command]
-fn select_minefia_project(
-    app: tauri::AppHandle,
-    project_id: String,
-    project_name: String,
-) -> Result<app_project::AppProject, errors::AppError> {
-    app_project::select_existing_project(&app, &project_id, &project_name).map_err(errors::classify)
-}
-
-#[tauri::command]
 fn minefia_usage_ready(app: tauri::AppHandle) -> Result<bool, errors::AppError> {
     app_project::usage_ready(&app).map_err(errors::classify)
 }
@@ -291,13 +300,20 @@ fn minefia_usage_ready(app: tauri::AppHandle) -> Result<bool, errors::AppError> 
 #[tauri::command]
 async fn create_minefia_project_key(
     app: tauri::AppHandle,
+    existing_project_id: Option<String>,
     project_name: String,
     service_account_name: String,
 ) -> Result<app_project::CreatedProjectKey, errors::AppError> {
     let admin_key = admin_credentials::load_selected(&app).map_err(errors::classify)?;
-    app_project::create_project_and_key(&app, &admin_key, &project_name, &service_account_name)
-        .await
-        .map_err(errors::classify)
+    app_project::create_project_and_key(
+        &app,
+        &admin_key,
+        existing_project_id.as_deref(),
+        &project_name,
+        &service_account_name,
+    )
+    .await
+    .map_err(errors::classify)
 }
 
 #[tauri::command]
@@ -334,6 +350,27 @@ async fn save_summary_translation(
     transcript_store::save_summary_translation(&app, &session_id, &source_name, &language, &text)
         .await
         .map_err(errors::classify)
+}
+
+#[tauri::command]
+async fn save_notes_translation(
+    app: tauri::AppHandle,
+    session_id: String,
+    source_name: String,
+    language: String,
+    text: String,
+    note_style: String,
+) -> Result<(), errors::AppError> {
+    transcript_store::save_notes_translation(
+        &app,
+        &session_id,
+        &source_name,
+        &language,
+        &text,
+        &note_style,
+    )
+    .await
+    .map_err(errors::classify)
 }
 
 #[tauri::command]
@@ -461,11 +498,19 @@ async fn update_summary_notes(
     previous_notes: String,
     new_transcript: String,
     model: String,
+    note_style: String,
 ) -> Result<String, errors::AppError> {
     let api_key = credentials::load_selected(&app).map_err(errors::classify)?;
-    summarization::append_notes(&app, &api_key, &previous_notes, &new_transcript, &model)
-        .await
-        .map_err(errors::classify)
+    summarization::append_notes(
+        &app,
+        &api_key,
+        &previous_notes,
+        &new_transcript,
+        &model,
+        &note_style,
+    )
+    .await
+    .map_err(errors::classify)
 }
 
 #[tauri::command]
@@ -509,7 +554,7 @@ async fn enhance_transcript(
     text: String,
 ) -> Result<String, errors::AppError> {
     let api_key = credentials::load_selected(&app).map_err(errors::classify)?;
-    translation::enhance_transcript(&api_key, &text)
+    translation::enhance_transcript(&app, &api_key, &text)
         .await
         .map_err(errors::classify)
 }
@@ -528,6 +573,7 @@ async fn transcribe_audio(
         &app,
         Path::new(&request.path),
         request.compress_audio,
+        &request.audio_quality,
         request.audio_stream_index,
         request.allow_reencode,
         &api_key,
@@ -595,6 +641,9 @@ fn start_system_audio(
     source: String,
     input_device: Option<String>,
     parallel_requests: usize,
+    quality: String,
+    compact_microphone: bool,
+    compact_system_audio: bool,
 ) -> Result<(), errors::AppError> {
     let api_key = credentials::load_selected(&app).map_err(errors::classify)?;
     system_audio::start(
@@ -605,6 +654,9 @@ fn start_system_audio(
         source,
         input_device,
         parallel_requests,
+        quality,
+        compact_microphone,
+        compact_system_audio,
     )
     .map_err(errors::classify)
 }
@@ -615,9 +667,22 @@ fn start_realtime_audio(
     manager: tauri::State<'_, realtime::RealtimeManager>,
     source: String,
     input_device: Option<String>,
+    quality: String,
+    compact_microphone: bool,
+    compact_system_audio: bool,
 ) -> Result<(), errors::AppError> {
     let api_key = credentials::load_selected(&app).map_err(errors::classify)?;
-    realtime::start(app, &manager, api_key, source, input_device).map_err(errors::classify)
+    realtime::start(
+        app,
+        &manager,
+        api_key,
+        source,
+        input_device,
+        quality,
+        compact_microphone,
+        compact_system_audio,
+    )
+    .map_err(errors::classify)
 }
 
 #[tauri::command]
@@ -655,6 +720,7 @@ pub fn run() {
             allow_media_preview,
             append_technical_log,
             inspect_online_media,
+            download_online_caption,
             inspect_web_page,
             extract_online_media,
             cancel_online_media,
@@ -672,15 +738,15 @@ pub fn run() {
             fetch_project_costs,
             list_admin_api_keys,
             save_admin_api_key,
-            get_minefia_project,
+            get_minefia_projects,
             list_openai_projects,
-            select_minefia_project,
             minefia_usage_ready,
             create_minefia_project_key,
             select_admin_api_key,
             delete_admin_api_key,
             save_transcript_translation,
             save_summary_translation,
+            save_notes_translation,
             snapshot_saved_transcript,
             replace_final_transcript,
             save_enhanced_transcript,

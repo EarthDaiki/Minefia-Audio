@@ -28,16 +28,17 @@ export function LibraryModal({
   onDeleteFile,
   onDeleteTranscript,
 }: Props) {
-  const [tab, setTab] = useState<"media" | "transcripts" | "enhanced" | "summaries" | "notes" | "translations" | "summaryTranslations">("media");
+  const [tab, setTab] = useState<"media" | "transcripts" | "enhanced" | "summaries" | "notes" | "translations" | "summaryTranslations" | "notesTranslations">("media");
   const [query, setQuery] = useState("");
   const filteredFiles = useMemo(() => files.filter((file) => file.name.toLowerCase().includes(query.toLowerCase())), [files, query]);
   const filteredTranscripts = useMemo(() => transcripts.filter((item) => {
     const matchesQuery = item.name.toLowerCase().includes(query.toLowerCase());
     if (!matchesQuery) return false;
     if (tab === "summaries") return item.kind === "summary";
-    if (tab === "notes") return item.kind === "notes";
+    if (tab === "notes") return item.kind === "notes" || item.kind === "study_notes";
     if (tab === "translations") return item.kind === "translation";
     if (tab === "summaryTranslations") return item.kind === "summary_translation";
+    if (tab === "notesTranslations") return item.kind === "notes_translation";
     if (tab === "enhanced") return item.kind === "enhanced";
     return item.kind === "transcript";
   }), [transcripts, query, tab]);
@@ -67,6 +68,7 @@ export function LibraryModal({
         <button className={tab === "notes" ? "selected" : ""} onClick={() => setTab("notes")}><FileText size={14} />Notes <small>{transcripts.filter((item) => item.kind === "notes").length}</small></button>
         <button className={tab === "translations" ? "selected" : ""} onClick={() => setTab("translations")}><FileText size={14} />Transcript translations <small>{transcripts.filter((item) => item.kind === "translation").length}</small></button>
         <button className={tab === "summaryTranslations" ? "selected" : ""} onClick={() => setTab("summaryTranslations")}><FileText size={14} />Summary translations <small>{transcripts.filter((item) => item.kind === "summary_translation").length}</small></button>
+        <button className={tab === "notesTranslations" ? "selected" : ""} onClick={() => setTab("notesTranslations")}><FileText size={14} />Note translations <small>{transcripts.filter((item) => item.kind === "notes_translation").length}</small></button>
       </div>
       <label className="library-search"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`Search ${tab}…`} /></label>
       <div className="library-items">

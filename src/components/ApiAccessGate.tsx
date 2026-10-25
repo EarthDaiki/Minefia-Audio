@@ -2,8 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { CircleAlert, Eye, EyeOff, KeyRound, Loader2, RefreshCw, ShieldCheck, FolderPlus, List, Check } from "lucide-react";
 import { errorMessage } from "../lib/errors";
-import type { AdminApiKeySummary, CreatedProjectKey, OpenAIProjectSummary } from "../types";
-import { rememberOpenAIKeyId } from "../lib/keyMetadata";
+import type { AdminApiKeySummary, OpenAIProjectSummary } from "../types";
 
 type Props = {
   state: "loading" | "missing" | "error";
@@ -88,7 +87,7 @@ export function ApiAccessGate({ state, keyLabel, error, adminKeys, onOpenSetting
               <button className={choice === "existing" ? "selected" : ""} onClick={() => { setChoice("existing"); setSaveError(""); }}>Use existing Project key</button>
             </div>}
             {choice === "create" && adminKeys.length > 0 ? <>
-              <p className="validation-note">This creates one Minefia Audio Project and a Service Account key. OpenAI Projects can be archived but cannot be deleted. The generated Project key is stored in Keychain using the Service Account name as its item name.</p>
+              <p className="validation-note">This creates a Project and Service Account for Minefia Audio. You can add more Projects and Service Accounts later in Settings. OpenAI Projects can be archived but cannot be deleted.</p>
               <label className="field-label" htmlFor="initial-project-name">Project name</label>
               <input className="text-field" id="initial-project-name" value={projectName} onChange={(event) => setProjectName(event.target.value)} placeholder="Minefia Audio" />
               <label className="field-label second-label" htmlFor="initial-service-account-name">Service Account name / Keychain item name</label>
@@ -112,8 +111,8 @@ export function ApiAccessGate({ state, keyLabel, error, adminKeys, onOpenSetting
                 </button>
               </>}
             </> : <>
-              {!adminKeys.length && <p className="validation-note">Enter a Project API key from a dedicated Minefia Audio Project. A dedicated Project is recommended so the app's usage and key access stay separate.</p>}
-              {adminKeys.length > 0 && <p className="validation-note">If you already created a Project just for Minefia Audio, enter its Project API key. Otherwise, use the recommended Project creation option.</p>}
+              {!adminKeys.length && <p className="validation-note"><strong>Recommended:</strong> create a dedicated Project for Minefia Audio so its API activity and usage stay separate from your other work. Enter a Project API key from that dedicated Project below.</p>}
+              {adminKeys.length > 0 && <p className="validation-note"><strong>Recommended:</strong> create a dedicated Project for Minefia Audio so this app’s API activity and usage stay separate. If you already have one, enter its Project API key below.</p>}
               <label className="field-label" htmlFor="initial-key-item-name">Keychain item name</label>
               <input className="text-field" id="initial-key-item-name" value={itemName} onChange={(event) => setItemName(event.target.value)} placeholder="Minefia Audio" />
               <label className="field-label second-label" htmlFor="initial-project-api-key">Project API key</label>
@@ -188,11 +187,11 @@ export function ApiAccessGate({ state, keyLabel, error, adminKeys, onOpenSetting
     if (choice === "create" && !projectName.trim()) return;
     setSaving(true); setSaveError("");
     try {
-      if (choice === "select" && selectedProject) {
-        await invoke("select_minefia_project", { projectId: selectedProject.id, projectName: selectedProject.name });
-      }
-      const created = await invoke<CreatedProjectKey>("create_minefia_project_key", { projectName: projectName.trim(), serviceAccountName: serviceAccountName.trim() });
-      rememberOpenAIKeyId(created.key.openaiKeyId);
+      await invoke("create_minefia_project_key", {
+        existingProjectId: choice === "select" ? selectedProject?.id ?? null : null,
+        projectName: choice === "select" && selectedProject ? selectedProject.name : projectName.trim(),
+        serviceAccountName: serviceAccountName.trim(),
+      });
       await onRetry();
     } catch (cause) { setSaveError(errorMessage(cause)); }
     finally { setSaving(false); }

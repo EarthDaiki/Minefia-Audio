@@ -157,13 +157,6 @@ fn format_diarized_segments(segments: &[Value]) -> Option<String> {
     })
 }
 
-fn diarized_segments_from_response(value: &Value) -> Option<String> {
-    value
-        .get("segments")
-        .and_then(Value::as_array)
-        .and_then(|segments| format_diarized_segments(segments))
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResumableJob {
@@ -180,6 +173,8 @@ struct JobState {
     id: String,
     source_path: String,
     compress_audio: bool,
+    #[serde(default = "default_audio_quality")]
+    compression_quality: String,
     audio_stream_index: u32,
     allow_reencode: bool,
     model: String,
@@ -190,6 +185,10 @@ struct JobState {
     transcript: String,
     #[serde(default)]
     context_prompt: Option<String>,
+}
+
+pub(crate) fn default_audio_quality() -> String {
+    "best".into()
 }
 
 #[derive(Debug, Error)]
@@ -296,6 +295,7 @@ pub async fn transcribe(
     app: &tauri::AppHandle,
     source: &Path,
     compress_audio: bool,
+    compression_quality: &str,
     audio_stream_index: u32,
     allow_reencode: bool,
     api_key: &str,
@@ -329,6 +329,7 @@ pub async fn transcribe(
         if state.source_path != source.to_string_lossy()
             || state.model != model
             || state.compress_audio != compress_audio
+            || (compress_audio && state.compression_quality != compression_quality)
             || state.audio_stream_index != audio_stream_index
             || state.allow_reencode != allow_reencode
             || state.context_prompt.as_deref() != context_prompt
@@ -350,6 +351,7 @@ pub async fn transcribe(
         let parts = audio::prepare(
             source,
             compress_audio,
+            compression_quality,
             audio_stream_index,
             allow_reencode,
             &prepared_dir,
@@ -367,6 +369,7 @@ pub async fn transcribe(
             id: id.to_string(),
             source_path: source.to_string_lossy().into_owned(),
             compress_audio,
+            compression_quality: compression_quality.to_owned(),
             audio_stream_index,
             allow_reencode,
             model: model.to_owned(),
@@ -513,6 +516,7 @@ pub async fn resume_job(
         app,
         Path::new(&state.source_path),
         state.compress_audio,
+        &state.compression_quality,
         state.audio_stream_index,
         state.allow_reencode,
         api_key,
@@ -644,12 +648,12 @@ pub async fn transcribe_recording_part(
         )?;
         let mut form = multipart::Form::new()
             .text("model", model.to_owned())
-            .text(
-                "response_format",
-                if diarize { "diarized_json" } else { "json" },
-            )
+            .text("stream", "true")
             .text("chunking_strategy", "auto")
             .part("file", file_part);
+        if diarize {
+            form = form.text("response_format", "diarized_json");
+        }
         if let Some(prompt) = actual_prompt {
             form = form.text("prompt", prompt.to_owned());
         }
@@ -664,8 +668,8 @@ pub async fn transcribe_recording_part(
             Ok(response) => {
                 let status = response.status();
                 let retry_after = retry_after_seconds(response.headers());
-                let body = response.text().await.unwrap_or_default();
                 if !status.is_success() {
+                    let body = response.text().await.unwrap_or_default();
                     let error = TranscriptionError::Api {
                         status: status.as_u16(),
                         message: api_error_message(&body)
@@ -678,18 +682,81 @@ pub async fn transcribe_recording_part(
                     }
                     return Err(error);
                 }
-                let value: Value = serde_json::from_str(&body)
-                    .map_err(|error| TranscriptionError::Stream(error.to_string()))?;
-                if diarize {
-                    if let Some(text) = diarized_segments_from_response(&value) {
-                        return Ok(text);
+
+                let mut stream = response.bytes_stream().eventsource();
+                let mut streamed_text = String::new();
+                let mut completed_text = None;
+                let mut diarized_segments = Vec::new();
+                while let Some(event) = stream.next().await {
+                    let event = match event {
+                        Ok(event) => event,
+                        Err(EventStreamError::Transport(error)) => {
+                            return Err(TranscriptionError::Network(error));
+                        }
+                        Err(error) => {
+                            return Err(TranscriptionError::Stream(error.to_string()));
+                        }
+                    };
+                    if event.data == "[DONE]" {
+                        break;
+                    }
+                    let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
+                        continue;
+                    };
+                    match value.get("type").and_then(Value::as_str) {
+                        Some("transcript.text.delta") => {
+                            if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                                streamed_text.push_str(delta);
+                                emit(
+                                    app,
+                                    ProgressEvent::delta(delta, chunk, 0),
+                                    "audio-capture",
+                                    "system",
+                                )?;
+                            }
+                        }
+                        Some("transcript.text.done") => {
+                            completed_text =
+                                value.get("text").and_then(Value::as_str).map(str::to_owned);
+                        }
+                        Some("transcript.text.segment") if diarize => {
+                            let segment = value.get("segment").unwrap_or(&value);
+                            diarized_segments.push(segment.clone());
+                            if let Some(text) = segment.get("text").and_then(Value::as_str) {
+                                let speaker = segment
+                                    .get("speaker")
+                                    .or_else(|| segment.get("speaker_id"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("Unknown speaker");
+                                let delta = format!("{speaker}: {text}\n");
+                                streamed_text.push_str(&delta);
+                                emit(
+                                    app,
+                                    ProgressEvent::delta(&delta, chunk, 0),
+                                    "audio-capture",
+                                    "system",
+                                )?;
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                return Ok(value
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned());
+                let result = if diarize {
+                    format_diarized_segments(&diarized_segments)
+                        .or(completed_text)
+                        .unwrap_or_else(|| streamed_text.clone())
+                } else {
+                    completed_text.unwrap_or_else(|| streamed_text.clone())
+                };
+                if streamed_text.is_empty() && !result.is_empty() {
+                    emit(
+                        app,
+                        ProgressEvent::delta(&result, chunk, 0),
+                        "audio-capture",
+                        "system",
+                    )?;
+                }
+                return Ok(result);
             }
             Err(error)
                 if (error.is_timeout() || error.is_connect()) && retry < MAX_TIMEOUT_RETRIES =>

@@ -108,6 +108,19 @@ pub fn save_with_openai_key_id(
     }
 
     let mut registry = load_registry_with_migration(app)?;
+    let previous_selection = if let Some(selected) = registry
+        .selected_id
+        .as_deref()
+        .filter(|selected| registry.keys.iter().any(|key| key.id == *selected))
+    {
+        match key_entry(selected)?.get_password() {
+            Ok(_) => Some(selected.to_owned()),
+            Err(keyring::Error::NoEntry) => None,
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        None
+    };
     let id = Uuid::new_v4().to_string();
     key_entry(&id)?.set_password(api_key)?;
     let metadata = KeyMetadata {
@@ -124,7 +137,8 @@ pub fn save_with_openai_key_id(
         openai_key_id: openai_key_id.map(str::to_owned),
     };
     registry.keys.push(metadata.clone());
-    registry.selected_id = Some(id.clone());
+    registry.selected_id = previous_selection.or_else(|| Some(id.clone()));
+    let is_selected = registry.selected_id.as_deref() == Some(&id);
     if let Err(error) = write_registry(app, &registry) {
         let _ = key_entry(&id)?.delete_credential();
         return Err(error);
@@ -134,7 +148,7 @@ pub fn save_with_openai_key_id(
         id,
         label: metadata.label,
         masked: format!("•••• {}", metadata.last_four),
-        is_selected: true,
+        is_selected,
         openai_key_id: metadata.openai_key_id,
     })
 }
@@ -188,6 +202,23 @@ pub fn load_selected(app: &AppHandle) -> Result<String, CredentialError> {
         keyring::Error::NoEntry => CredentialError::Missing,
         other => other.into(),
     })
+}
+
+/// Returns the OpenAI-managed key ID for the selected default key, if it is a
+/// Service Account key created and registered by Minefia Audio.
+pub fn selected_openai_key_id(app: &AppHandle) -> Result<Option<String>, CredentialError> {
+    let registry = load_registry_with_migration(app)?;
+    let Some(id) = registry.selected_id else {
+        return Ok(None);
+    };
+    let Some(key) = registry.keys.iter().find(|key| key.id == id) else {
+        return Ok(None);
+    };
+    match key_entry(&id)?.get_password() {
+        Ok(_) => Ok(key.openai_key_id.clone()),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn key_entry(id: &str) -> Result<Entry, CredentialError> {

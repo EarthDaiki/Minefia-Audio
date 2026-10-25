@@ -72,6 +72,7 @@ struct TranslationEvent {
     delta: Option<String>,
     chunk: usize,
     total_chunks: usize,
+    cached_tokens: Option<u64>,
 }
 
 pub async fn translate(
@@ -132,6 +133,7 @@ pub async fn translate(
 
 /// Reviews a transcript in its original language while preserving spoken content.
 pub async fn enhance_transcript(
+    app: &tauri::AppHandle,
     api_key: &str,
     transcript: &str,
 ) -> Result<String, TranslationError> {
@@ -140,8 +142,9 @@ pub async fn enhance_transcript(
     }
     let client = Client::builder().build()?;
     let chunks = split_verbatim_text(transcript, MAX_CHARS_PER_REQUEST);
+    let total = chunks.len();
     let mut enhanced = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
+    for (index, chunk) in chunks.into_iter().enumerate() {
         let response = client
             .post(RESPONSES_URL)
             .bearer_auth(api_key)
@@ -164,7 +167,7 @@ pub async fn enhance_transcript(
                     .unwrap_or_else(|| body.chars().take(500).collect()),
             });
         }
-        enhanced.push(read_enhancement_stream(response).await?);
+        enhanced.push(read_enhancement_stream(app, response, index, total).await?);
     }
     Ok(enhanced.join(""))
 }
@@ -192,7 +195,12 @@ fn split_verbatim_text(value: &str, max_chars: usize) -> Vec<String> {
     chunks
 }
 
-async fn read_enhancement_stream(response: reqwest::Response) -> Result<String, TranslationError> {
+async fn read_enhancement_stream(
+    app: &tauri::AppHandle,
+    response: reqwest::Response,
+    index: usize,
+    total: usize,
+) -> Result<String, TranslationError> {
     let mut stream = response.bytes_stream().eventsource();
     let mut streamed_text = String::new();
     let mut completed_text: Option<String> = None;
@@ -219,6 +227,7 @@ async fn read_enhancement_stream(response: reqwest::Response) -> Result<String, 
             Some("response.output_text.done") => {
                 completed_text = value.get("text").and_then(Value::as_str).map(str::to_owned);
             }
+            Some("response.completed") => emit_cached_tokens(app, index, total, &value)?,
             Some("error") | Some("response.failed") => {
                 let message = value
                     .pointer("/error/message")
@@ -276,6 +285,7 @@ async fn read_stream(
             Some("response.output_text.done") => {
                 completed_text = value.get("text").and_then(Value::as_str).map(str::to_owned);
             }
+            Some("response.completed") => emit_cached_tokens(app, index, total, &value)?,
             Some("error") => {
                 let message = value
                     .pointer("/error/message")
@@ -333,6 +343,7 @@ impl TranslationEvent {
             delta: Some(delta.into()),
             chunk,
             total_chunks,
+            cached_tokens: None,
         }
     }
 
@@ -342,8 +353,35 @@ impl TranslationEvent {
             delta: None,
             chunk: total_chunks,
             total_chunks,
+            cached_tokens: None,
         }
     }
+}
+
+fn emit_cached_tokens(
+    app: &tauri::AppHandle,
+    index: usize,
+    total: usize,
+    value: &Value,
+) -> Result<(), TranslationError> {
+    let Some(cached_tokens) = value
+        .pointer("/response/usage/input_tokens_details/cached_tokens")
+        .and_then(Value::as_u64)
+        .filter(|tokens| *tokens > 0)
+    else {
+        return Ok(());
+    };
+    app.emit(
+        "translation-progress",
+        TranslationEvent {
+            kind: "prompt_cache",
+            delta: None,
+            chunk: index + 1,
+            total_chunks: total,
+            cached_tokens: Some(cached_tokens),
+        },
+    )
+    .map_err(|error| TranslationError::Event(error.to_string()))
 }
 
 fn validate_model(model: &str) -> Result<(), TranslationError> {

@@ -189,7 +189,7 @@ fn inspect_impl(
                 };
               });
               return {
-                title: document.title || location.hostname,
+                title: document.querySelector('title')?.textContent?.trim() || document.title || location.hostname,
                 media: media.filter(item => item.ready && item.url && !item.url.startsWith('blob:') && /^https?:/i.test(item.url)),
                 hasBlobMedia: elements.some(element => (element.currentSrc || element.src || '').startsWith('blob:'))
               };

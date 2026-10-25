@@ -308,6 +308,7 @@ pub async fn save_notes(
     id: &str,
     name: &str,
     text: &str,
+    note_style: &str,
 ) -> Result<(), String> {
     let id = Uuid::parse_str(id).map_err(|_| "Invalid transcript session identifier.")?;
     if text.trim().is_empty() {
@@ -319,11 +320,53 @@ pub async fn save_notes(
         Some(path) => path,
         None => new_session_dir(&root, &session_id, name).await?,
     };
-    let temp = directory.join("notes.md.tmp");
+    let file_name = match note_style {
+        "meeting" => "notes.md",
+        "study" => "study-notes.md",
+        _ => return Err("Unsupported note format.".into()),
+    };
+    let temp = directory.join(format!("{file_name}.tmp"));
     tokio::fs::write(&temp, text.trim())
         .await
         .map_err(|error| error.to_string())?;
-    tokio::fs::rename(temp, directory.join("notes.md"))
+    tokio::fs::rename(temp, directory.join(file_name))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn save_notes_translation(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    source_name: &str,
+    language: &str,
+    text: &str,
+    note_style: &str,
+) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    let session_id = Uuid::parse_str(session_id)
+        .map_err(|_| "A transcript session is required to save translated notes.")?;
+    let session = existing_session_dir(app, &session_id.to_string())
+        .await?
+        .ok_or_else(|| "The source transcript folder could not be found.".to_owned())?;
+    let style_directory = match note_style {
+        "meeting" => "meeting",
+        "study" => "study",
+        _ => return Err("Unsupported note format.".into()),
+    };
+    let directory = session.join("notes-translations").join(style_directory);
+    tokio::fs::create_dir_all(&directory)
+        .await
+        .map_err(|error| error.to_string())?;
+    let stem = safe_audio_stem(source_name.trim_end_matches(".txt"));
+    let language = safe_file_stem(language);
+    let file_name = format!("{stem}__{language}.txt");
+    let temporary = directory.join(format!(".{file_name}.tmp"));
+    tokio::fs::write(&temporary, text.as_bytes())
+        .await
+        .map_err(|error| error.to_string())?;
+    tokio::fs::rename(temporary, directory.join(file_name))
         .await
         .map_err(|error| error.to_string())
 }
@@ -726,6 +769,59 @@ pub async fn list(app: &tauri::AppHandle) -> Result<Vec<SavedTranscript>, String
                 });
             }
         }
+        if let Ok(notes) = tokio::fs::read_to_string(session.join("study-notes.md")).await {
+            if !notes.trim().is_empty() {
+                result.push(SavedTranscript {
+                    id: format!("study-notes:{id}"),
+                    name: format!("{name} · Study Notes"),
+                    date: date.clone(),
+                    text: notes,
+                    kind: "study_notes".into(),
+                    path: session
+                        .join("study-notes.md")
+                        .to_string_lossy()
+                        .into_owned(),
+                });
+            }
+        }
+        let notes_translations_dir = session.join("notes-translations");
+        for (style_directory, note_style) in [("meeting", "meeting"), ("study", "study")] {
+            let style_dir = notes_translations_dir.join(style_directory);
+            if let Ok(mut files) = tokio::fs::read_dir(&style_dir).await {
+                while let Some(file) = files
+                    .next_entry()
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    if file
+                        .path()
+                        .extension()
+                        .is_none_or(|extension| extension != "txt")
+                    {
+                        continue;
+                    }
+                    let text = tokio::fs::read_to_string(file.path())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    let file_name = file.file_name().to_string_lossy().into_owned();
+                    let language = file_name
+                        .split_once("__")
+                        .map(|(_, value)| value.trim_end_matches(".txt"))
+                        .unwrap_or("Translation");
+                    result.push(SavedTranscript {
+                        id: format!("notes-translation:{id}:{note_style}:{file_name}"),
+                        name: format!("Notes · {} → {language}", safe_audio_stem(&name)),
+                        date: date.clone(),
+                        text,
+                        kind: "notes_translation".into(),
+                        path: file.path().to_string_lossy().into_owned(),
+                    });
+                }
+            }
+        }
         let summary_translations_dir = session.join("summary-translations");
         if let Ok(mut files) = tokio::fs::read_dir(&summary_translations_dir).await {
             while let Some(file) = files
@@ -876,6 +972,37 @@ pub async fn list(app: &tauri::AppHandle) -> Result<Vec<SavedTranscript>, String
 }
 
 pub async fn remove(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
+    if let Some(rest) = id.strip_prefix("notes-translation:") {
+        let (session_id, style_and_file) = rest
+            .split_once(':')
+            .ok_or("Invalid notes translation identifier.")?;
+        let (style, file_name) = style_and_file
+            .split_once(':')
+            .ok_or("Invalid notes translation identifier.")?;
+        if Uuid::parse_str(session_id).is_err()
+            || !matches!(style, "meeting" | "study")
+            || PathBuf::from(file_name)
+                .file_name()
+                .is_none_or(|name| name != file_name)
+        {
+            return Err("Invalid notes translation identifier.".into());
+        }
+        if let Some(session) = existing_session_dir(app, session_id).await? {
+            return match tokio::fs::remove_file(
+                session
+                    .join("notes-translations")
+                    .join(style)
+                    .join(file_name),
+            )
+            .await
+            {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.to_string()),
+            };
+        }
+        return Ok(());
+    }
     if let Some(rest) = id.strip_prefix("summary-translation:") {
         let (session_id, file_name) = rest
             .split_once(':')
@@ -982,9 +1109,11 @@ pub async fn remove(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
     }
     let is_summary = id.starts_with("summary:");
     let is_notes = id.starts_with("notes:");
+    let is_study_notes = id.starts_with("study-notes:");
     let raw_id = id
         .strip_prefix("summary:")
         .or_else(|| id.strip_prefix("notes:"))
+        .or_else(|| id.strip_prefix("study-notes:"))
         .unwrap_or(id);
     let id = Uuid::parse_str(raw_id).map_err(|_| "Invalid transcript session identifier.")?;
     let Some(directory) = existing_session_dir(app, &id.to_string()).await? else {
@@ -1014,6 +1143,12 @@ pub async fn remove(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
         }
     } else if is_notes {
         match tokio::fs::remove_file(canonical_directory.join("notes.md")).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    } else if is_study_notes {
+        match tokio::fs::remove_file(canonical_directory.join("study-notes.md")).await {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.to_string()),

@@ -12,7 +12,7 @@ export type AudioInfo = {
   contextPrompt?: string | null;
 };
 
-export type SavedTranscript = { id: string; name: string; date: string; text: string; kind: "transcript" | "enhanced" | "summary" | "notes" | "translation" | "summary_translation"; path: string };
+export type SavedTranscript = { id: string; name: string; date: string; text: string; kind: "transcript" | "enhanced" | "summary" | "notes" | "study_notes" | "translation" | "summary_translation" | "notes_translation"; path: string };
 export type LibraryFile = { path: string; name: string; date: string; sizeBytes: number; isReference: boolean; contextPrompt?: string | null };
 
 export type AudioTrackInfo = {
@@ -39,19 +39,21 @@ export type TranscriptionEvent = {
 };
 
 export type TranslationEvent = {
-  kind: "delta" | "done";
+  kind: "delta" | "done" | "prompt_cache";
   delta?: string;
   chunk: number;
   totalChunks: number;
+  cachedTokens?: number;
 };
 
 export type SummaryEvent = {
-  kind: "start" | "delta" | "done";
+  kind: "start" | "delta" | "done" | "prompt_cache";
   mode: "notes" | "summary" | "question";
   delta?: string;
+  cachedTokens?: number;
 };
 
-export type ProjectCosts = { projectId: string; days: { date: string; models: { model: string; amountUsd: number }[]; totalUsd: number }[]; totalUsd: number; currency: string };
+export type ProjectCosts = { projectIds: string[]; days: { date: string; models: { model: string; amountUsd: number }[]; totalUsd: number }[]; totalUsd: number; currency: string };
 
 export type SystemAudioEvent = {
   kind: "status" | "queue" | "warning" | "transcript" | "capture_stopped" | "error" | "done";
@@ -79,7 +81,15 @@ export type RealtimeAudioEvent = {
   code?: string;
 };
 
-export type InputDevice = { id: string; name: string };
+export type InputDevice = {
+  id: string;
+  name: string;
+  supportedSampleRates: number[];
+  maxSupportedSampleRate: number | null;
+  supportedChannels: number[];
+  defaultSampleRate: number | null;
+  defaultChannels: number | null;
+};
 
 export type OnlineMediaInfo = {
   url: string;
@@ -93,11 +103,20 @@ export type OnlineMediaInfo = {
   audioOnly: boolean;
   hasVideo: boolean;
   audioCodec: string;
+  language?: string | null;
   audioBitrateKbps?: number | null;
   sampleRateHz?: number | null;
   videoHeight?: number | null;
   requiresConversion: boolean;
   availableFormats: OnlineMediaFormat[];
+  captions: OnlineCaption[];
+};
+
+export type OnlineCaption = {
+  id: string;
+  language: string;
+  label: string;
+  automatic: boolean;
 };
 
 export type OnlineMediaFormat = {
@@ -107,6 +126,7 @@ export type OnlineMediaFormat = {
   audioOnly: boolean;
   hasVideo: boolean;
   audioCodec: string;
+  language?: string | null;
   audioBitrateKbps?: number | null;
   sampleRateHz?: number | null;
   videoHeight?: number | null;
@@ -132,6 +152,7 @@ export type PageMediaInfo = {
 export type TranscribeRequest = {
   path: string;
   compressAudio: boolean;
+  audioQuality: "low" | "standard" | "high" | "best";
   audioStreamIndex: number;
   allowReencode: boolean;
   model: string;
@@ -161,7 +182,8 @@ export type ApiKeySummary = {
 
 export type AdminApiKeySummary = ApiKeySummary;
 export type OpenAIProjectSummary = { id: string; name: string; status: string };
-export type MinefiaProject = { projectId: string | null; projectName: string | null; createdByApp: boolean; serviceAccountId: string | null; serviceAccountName: string | null; apiKeyId: string | null };
+export type MinefiaServiceAccount = { serviceAccountId: string; serviceAccountName: string; apiKeyId: string };
+export type MinefiaProject = { projectId: string; projectName: string; createdByApp: boolean; serviceAccounts: MinefiaServiceAccount[] };
 export type CreatedProjectKey = { project: MinefiaProject; key: ApiKeySummary };
 
 export type TranscriptionModel = {

@@ -8,6 +8,9 @@ A Tauri desktop app that sends audio to the OpenAI Audio Transcriptions API, dis
 
 - Live transcript rendering with `stream=true`
 - Multiple OpenAI API keys stored individually in the system Keychain
+- Multiple independent Project API keys can be saved, selected, and managed in Settings
+- Multiple OpenAI Projects and Service Accounts can be registered; generated Service Account keys are saved as separate Project API keys
+- Usage can aggregate daily, per-model Costs API data across registered Projects with available Service Account keys
 - API key validation with `GET /v1/models` before anything is saved
 - Selectable transcription models with short in-app explanations
 - Pre-transcription USD cost estimates based on audio duration and the official per-minute model rates
@@ -17,8 +20,8 @@ A Tauri desktop app that sends audio to the OpenAI Audio Transcriptions API, dis
 - Lossless audio extraction with `-c:a copy` into a codec-compatible API container whenever possible
 - Files without an audio stream return `NO_AUDIO_STREAM`
 - Re-encoding required by an unsupported codec is blocked until the user confirms the conversion dialog
-- Original audio is preserved by default
-- Optional **AAC / 64 kbps / 16 kHz / mono** compression
+- Original local audio is preserved by default and Local File does not offer compact conversion
+- Recording quality presets: Low **AAC / 32 kbps / 16 kHz**, Standard **64 kbps / 16 kHz**, High **96 kbps / 24 kHz**, and Best **128 kbps / 48 kHz**; all are mono
 - Audio is split into roughly five-minute parts at silence, with a 20 MB maximum per part
 - Up to two parts are transcribed concurrently and merged in source order
 - Network timeouts retry up to three times with a short exponential delay
@@ -43,16 +46,19 @@ A Tauri desktop app that sends audio to the OpenAI Audio Transcriptions API, dis
 - Temporary network failures and HTTP 429/5xx responses retry with exponential backoff and honor `Retry-After` when provided
 - Runtime errors carry stable codes such as `NO_AUDIO_STREAM`, `CONVERSION_REQUIRED`, `API_RATE_LIMITED`, and `DEVICE_DISCONNECTED`
 - A Markdown summary mode incrementally merges each new transcript chunk into running bullet notes; when recording stops, it creates a final summary from the full transcript
+- Incremental notes can use either meeting-minutes formatting or comprehensive Cornell-style university study notes, and notes can be translated and saved separately in the Library
 - Summary calls stream from the Responses API and use the selected Luna/Sol text model; the estimated summary cost is shown before enabling the extra processing
 - **System Audio · Standard Mode** captures playback audio with ScreenCaptureKit on macOS and WASAPI Loopback on Windows
 - Standard Mode waits until 90 seconds, then splits on at least 0.5 seconds of audio at or below -35 dBFS
 - A 150-second hard limit guarantees bounded chunks and reports a force-split warning when no silence is available
 - Capture continues while up to two transcription requests run concurrently; results are restored to chunk order
 - Stopping flushes and transcribes the remaining buffer even when it is shorter than 90 seconds
-- Standard Mode records 48 kHz stereo PCM, limits in-memory audio to 64 MB, and reuses the existing 20 MB upload preparation guard
+- Settings contains one shared Microphone + System Audio Compact switch. When on, both capture sources are saved as mono AAC using the selected quality preset; when off, both are saved as uncompressed mono WAV
 - **Microphone Standard Mode** accepts the selected built-in, USB, headset, or interface input and reuses the exact same 90-second silence / 150-second forced-split pipeline
 - Microphone input selection, connection availability, and live input level are shown before and during capture
-- **System Audio and Microphone · Live Mode** stream 24 kHz mono PCM to a `gpt-live-transcribe` Realtime transcription session and render partial/final captions as events arrive
+- Microphone device sample-rate and channel capabilities are shown; capture selects the closest supported native format and converts to the chosen recording preset
+- HLS audio variants can be selected before download; extracted Online Media preserves the source audio codec without compact re-encoding
+- **System Audio and Microphone · Live Mode** stream 24 kHz, 16-bit, mono PCM to a `gpt-live-transcribe` Realtime transcription session and render partial/final captions as events arrive; the saved recording keeps the selected capture quality
 - Live Mode uses client-side speech-end detection to commit turns; it does not use Standard Mode's chunk splitter
 - Live Mode reconnects after temporary network interruptions and displays elapsed time and an estimated cost at about $1.02/hour
 - The live model appears only when the selected key returns `gpt-live-transcribe` from `GET /v1/models`
