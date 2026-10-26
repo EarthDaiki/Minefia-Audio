@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "prepare:bundled-tools": "node scripts/prepare-bundled-tools.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },
@@ -15,6 +16,9 @@
     "lucide-react": "^0.468.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0"
+  },
+  "optionalDependencies": {
+    "@dfloresc/ffmpeg-macos-lgpl": "9.0.1-1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.12.2",

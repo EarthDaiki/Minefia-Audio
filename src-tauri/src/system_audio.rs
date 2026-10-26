@@ -1273,7 +1273,29 @@ fn process_audio(
         chunker.emit_status(&app, price_per_minute);
     }
     if let Some(chunk) = chunker.finish() {
-        let _ = chunks.blocking_send(chunk);
+        let chunk_index = chunk.index;
+        let duration_seconds = chunk.duration_seconds;
+        if chunks.blocking_send(chunk).is_ok() {
+            let _ = app.emit(
+                "system-audio-progress",
+                SystemAudioEvent {
+                    kind: "final_chunk_queued",
+                    elapsed_seconds: 0.0,
+                    chunk_seconds: duration_seconds,
+                    completed_chunks: chunk_index.saturating_sub(1),
+                    queued_chunks: 1,
+                    active_requests: 0,
+                    waiting_for_silence: false,
+                    force_split_in_seconds: 0.0,
+                    estimated_cost: 0.0,
+                    chunk: Some(chunk_index),
+                    text: None,
+                    message: Some("Final buffered audio part queued for transcription.".into()),
+                    code: None,
+                    input_level: None,
+                },
+            );
+        }
     }
 }
 
@@ -1964,13 +1986,87 @@ mod platform {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(target_os = "linux")]
+mod platform {
+    use super::{PcmBatch, CHANNELS};
+    use flexaudio::{OutputFormat, SourceKind, StreamConfig};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::SyncSender,
+        Arc,
+    };
+    use std::time::Duration;
+
+    fn float_to_i16(value: f32) -> i16 {
+        (value.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16
+    }
+
+    pub fn capture(
+        stop: Arc<AtomicBool>,
+        sender: SyncSender<PcmBatch>,
+        sample_rate: u32,
+    ) -> Result<(), String> {
+        let config = StreamConfig {
+            kind: SourceKind::SystemLoopback,
+            output: OutputFormat {
+                sample_rate,
+                channels: CHANNELS,
+            },
+            exclude_self: true,
+            silence_probe: false,
+            ..StreamConfig::default()
+        };
+        let mut stream = flexaudio::open(config).map_err(|error| {
+            format!(
+                "PipeWire system audio capture could not start: {error}. Ensure PipeWire is running and audio output is available."
+            )
+        })?;
+        stream.start().map_err(|error| {
+            format!(
+                "PipeWire system audio capture could not start: {error}. Ensure PipeWire is running and audio output is available."
+            )
+        })?;
+
+        while !stop.load(Ordering::Acquire) {
+            if let Some(error) = stream.terminal_error() {
+                stream.stop();
+                return Err(format!("PipeWire system audio capture stopped: {error}"));
+            }
+
+            let mut received_audio = false;
+            while let Some(chunk) = stream.poll_chunk() {
+                received_audio = true;
+                let samples = chunk.data.into_iter().map(float_to_i16).collect::<Vec<_>>();
+                if !samples.is_empty()
+                    && sender
+                        .send(PcmBatch {
+                            samples,
+                            sample_rate,
+                            channels: CHANNELS,
+                        })
+                        .is_err()
+                {
+                    stream.stop();
+                    return Ok(());
+                }
+            }
+            if !received_audio {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        stream.stop();
+        Ok(())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 mod platform {
     use super::PcmBatch;
     use std::sync::{atomic::AtomicBool, mpsc::SyncSender, Arc};
 
     pub fn capture(_: Arc<AtomicBool>, _: SyncSender<PcmBatch>, _: u32) -> Result<(), String> {
-        Err("System Audio Standard Mode is available only on macOS and Windows.".into())
+        Err("System Audio capture is not available on this operating system.".into())
     }
 }
 
@@ -2014,6 +2110,17 @@ mod tests {
         let chunks = chunker.push(speech);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].duration_seconds, 150.0);
+    }
+
+    #[test]
+    fn finish_flushes_a_short_final_audio_buffer() {
+        let mut chunker = SilenceChunker::default();
+        let final_samples = vec![1_000; SAMPLE_RATE as usize * CHANNELS as usize / 4];
+        assert!(chunker.push(final_samples.clone()).is_empty());
+        let final_chunk = chunker.finish().expect("remaining audio must be flushed");
+        assert_eq!(final_chunk.samples, final_samples);
+        assert_eq!(final_chunk.index, 1);
+        assert!(chunker.finish().is_none());
     }
 
     #[test]

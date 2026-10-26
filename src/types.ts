@@ -56,7 +56,7 @@ export type SummaryEvent = {
 export type ProjectCosts = { projectIds: string[]; days: { date: string; models: { model: string; amountUsd: number }[]; totalUsd: number }[]; totalUsd: number; currency: string };
 
 export type SystemAudioEvent = {
-  kind: "status" | "queue" | "warning" | "transcript" | "capture_stopped" | "error" | "done";
+  kind: "status" | "queue" | "warning" | "transcript" | "final_chunk_queued" | "capture_stopped" | "error" | "done";
   elapsedSeconds: number;
   chunkSeconds: number;
   completedChunks: number;

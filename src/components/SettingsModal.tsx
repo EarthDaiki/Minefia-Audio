@@ -18,6 +18,8 @@ type Props = {
   captureQualityRestrictionNote: string;
   compactEnabled: boolean;
   onCompactEnabledChange: (value: boolean) => void;
+  compactChangeDeferred: boolean;
+  summaryModelLocked: boolean;
   technicalErrors: boolean;
   onTechnicalErrorsChange: (value: boolean) => void;
   technicalDetails: boolean;
@@ -35,7 +37,7 @@ type Props = {
   onQuestionModelChange: (value: string) => void;
 };
 
-export function SettingsModal({ open, keys, adminKeys, onClose, onChanged, parallelRequests, onParallelRequestsChange, captureQuality, onCaptureQualityChange, availableCaptureQualities, captureQualityRestrictionNote, compactEnabled, onCompactEnabledChange, technicalErrors, onTechnicalErrorsChange, technicalDetails, onTechnicalDetailsChange, headlessBrowser, onHeadlessBrowserChange, translationModels, summaryModel, onSummaryModelChange, transcriptTranslationModel, onTranscriptTranslationModelChange, summaryTranslationModel, onSummaryTranslationModelChange, questionModel, onQuestionModelChange }: Props) {
+export function SettingsModal({ open, keys, adminKeys, onClose, onChanged, parallelRequests, onParallelRequestsChange, captureQuality, onCaptureQualityChange, availableCaptureQualities, captureQualityRestrictionNote, compactEnabled, onCompactEnabledChange, compactChangeDeferred, summaryModelLocked, technicalErrors, onTechnicalErrorsChange, technicalDetails, onTechnicalDetailsChange, headlessBrowser, onHeadlessBrowserChange, translationModels, summaryModel, onSummaryModelChange, transcriptTranslationModel, onTranscriptTranslationModelChange, summaryTranslationModel, onSummaryTranslationModelChange, questionModel, onQuestionModelChange }: Props) {
   const [tab, setTab] = useState<"keys" | "projects" | "models" | "general">("keys");
   const [label, setLabel] = useState("");
   const [key, setKey] = useState("");
@@ -179,9 +181,10 @@ export function SettingsModal({ open, keys, adminKeys, onClose, onChanged, paral
             <p className="validation-note">Choose a model independently for each task. Audio transcription models are selected on the main screen.</p>
             {modelFields.map((field) => {
               const model = translationModels.find((item) => item.id === field.value);
+              const locked = field.label === "Summary" && summaryModelLocked;
               return <label className="settings-model-row" key={field.label}>
-                <span><strong>{field.label}</strong><small>{model?.description ?? "No supported model available for this API key."}</small></span>
-                <select value={field.value} onChange={(event) => field.change(event.target.value)} disabled={translationModels.length === 0} aria-label={`${field.label} model`}>
+                <span><strong>{field.label}</strong><small>{model?.description ?? "No supported model available for this API key."}</small>{locked && <small className="settings-warning">A recording or notes task is using {model?.name ?? field.value}. You can change this after the task finishes.</small>}</span>
+                <select value={field.value} onChange={(event) => field.change(event.target.value)} disabled={translationModels.length === 0 || locked} aria-label={`${field.label} model`}>
                   {translationModels.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}
                 </select>
               </label>;
@@ -292,6 +295,7 @@ export function SettingsModal({ open, keys, adminKeys, onClose, onChanged, paral
                 <div><strong>Microphone &amp; System Audio Compact</strong><p className="validation-note">One shared recording setting. When on, both sources are saved as mono AAC using the selected bitrate and sample rate. When off, both are saved as uncompressed mono WAV. Online media is always extracted without re-encoding.</p></div>
                 <button className={`toggle ${compactEnabled ? "on" : ""}`} role="switch" aria-checked={compactEnabled} aria-label="Compact audio" onClick={() => onCompactEnabledChange(!compactEnabled)}><i /></button>
               </div>
+              {compactChangeDeferred && <p className="settings-warning compact-deferred-warning">A recording is in progress. Its Compact setting will not change; this choice applies to the next recording.</p>}
             </section>
             <section className="settings-section">
               <h3>Processing</h3>

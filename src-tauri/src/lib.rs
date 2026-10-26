@@ -12,6 +12,7 @@ mod storage;
 mod summarization;
 mod system_audio;
 mod technical_log;
+mod tooling;
 mod transcript_store;
 mod transcription;
 mod translation;
@@ -526,6 +527,19 @@ async fn summarize_transcript(
 }
 
 #[tauri::command]
+async fn generate_final_notes(
+    app: tauri::AppHandle,
+    text: String,
+    model: String,
+    note_style: String,
+) -> Result<String, errors::AppError> {
+    let api_key = credentials::load_selected(&app).map_err(errors::classify)?;
+    summarization::generate_final_notes(&app, &api_key, &text, &model, &note_style)
+        .await
+        .map_err(errors::classify)
+}
+
+#[tauri::command]
 async fn ask_about_transcript(
     app: tauri::AppHandle,
     transcript: String,
@@ -703,6 +717,7 @@ fn stop_system_audio(
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
+            tooling::initialize(app.path().resource_dir()?);
             // Captures and extracted media remain available to the in-app player.
             let recordings = app.path().app_data_dir()?.join("recordings");
             std::fs::create_dir_all(&recordings)?;
@@ -760,6 +775,7 @@ pub fn run() {
             delete_saved_transcript,
             translate_transcript,
             update_summary_notes,
+            generate_final_notes,
             summarize_transcript,
             ask_about_transcript,
             enhance_transcript,

@@ -2,7 +2,6 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
-    env,
     path::{Path, PathBuf},
     process::Stdio,
 };
@@ -528,32 +527,7 @@ fn nearest_silence(target: f64, start: f64, end: f64, silences: &[f64]) -> Optio
 }
 
 pub(crate) fn find_binary(name: &str) -> Option<PathBuf> {
-    let override_name = format!("MINEFIA_{}", name.to_uppercase());
-    if let Some(path) = env::var_os(override_name)
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
-    {
-        return Some(path);
-    }
-
-    let executable = if cfg!(windows) {
-        format!("{name}.exe")
-    } else {
-        name.to_owned()
-    };
-    if let Some(paths) = env::var_os("PATH") {
-        for directory in env::split_paths(&paths) {
-            let candidate = directory.join(&executable);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
-        .iter()
-        .map(|directory| Path::new(directory).join(&executable))
-        .find(|path| path.is_file())
+    crate::tooling::find_binary(name)
 }
 
 #[cfg(test)]

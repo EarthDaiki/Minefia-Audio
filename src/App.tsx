@@ -55,6 +55,7 @@ type OnlineDownloadProgressEvent = {
 
 type TechnicalLogEntry = { taskId: string; taskName: string; timestamp: string; category: string; message: string };
 type TechnicalTask = { id: string; name: string };
+type SourceMode = "file" | "online" | "system";
 const CAPTURE_QUALITY_PRESETS = [
   { key: "low", sampleRate: 16_000, bitrate: 32, label: "Low" },
   { key: "standard", sampleRate: 16_000, bitrate: 64, label: "Standard" },
@@ -125,12 +126,13 @@ export default function App() {
     return value === "low" || value === "standard" || value === "high" || value === "best" ? value : "standard";
   });
   const [compactEnabled, setCompactEnabled] = useState(() => localStorage.getItem("compact-enabled") !== "false");
+  const [compactChangeDeferred, setCompactChangeDeferred] = useState(false);
   const [technicalErrors, setTechnicalErrors] = useState(() => localStorage.getItem("technical-errors") === "true");
   const [technicalDetails, setTechnicalDetails] = useState(() => localStorage.getItem("technical-details") === "true");
-  const [technicalLogs, setTechnicalLogs] = useState<TechnicalLogEntry[]>([]);
-  const [technicalTaskName, setTechnicalTaskName] = useState("");
-  const technicalTaskRef = useRef<TechnicalTask | null>(null);
-  const lastTechnicalLogRef = useRef<{ signature: string; at: number } | null>(null);
+  const [technicalLogsBySlot, setTechnicalLogsBySlot] = useState<Record<SourceMode, TechnicalLogEntry[]>>({ file: [], online: [], system: [] });
+  const [technicalTaskNamesBySlot, setTechnicalTaskNamesBySlot] = useState<Record<SourceMode, string>>({ file: "", online: "", system: "" });
+  const technicalTaskRefs = useRef<Record<SourceMode, TechnicalTask | null>>({ file: null, online: null, system: null });
+  const lastTechnicalLogRefs = useRef<Record<SourceMode, { signature: string; at: number } | null>>({ file: null, online: null, system: null });
   const lastLoggedDownloadProgress = useRef({ stage: "", bytes: 0, partMark: -1, percentMark: -1 });
   const [headlessBrowser, setHeadlessBrowser] = useState(() => localStorage.getItem("headless-browser") === "true");
   const [resumableJobs, setResumableJobs] = useState<ResumableJob[]>([]);
@@ -190,6 +192,10 @@ export default function App() {
   const [enhancementRunning, setEnhancementRunning] = useState(false);
   const [transcriptionContextPrompt, setTranscriptionContextPrompt] = useState("");
   const [transcriptionPrompts, setTranscriptionPrompts] = useState<Record<number, string | null>>({});
+  const [notesUpdating, setNotesUpdating] = useState(false);
+  const notesUpdatesPending = useRef(0);
+  const summaryLogSlotRef = useRef<SourceMode>("file");
+  const translationLogSlotRef = useRef<SourceMode>("file");
   const [translationModel, setTranslationModel] = useState(() => {
     const stored = localStorage.getItem("translation-model");
     return TRANSLATION_MODELS.some((item) => item.id === stored) ? stored! : "gpt-6-luna";
@@ -312,17 +318,19 @@ export default function App() {
     summaryTranslations: Record<string, string>; questionMessages: { role: "user" | "assistant"; text: string }[];
     notesText: string; notesMode: boolean; notesStyle: "meeting" | "study"; notesTranslations: Record<string, string>; summaryTranslationLive: boolean;
     activeLanguage: string; completed: boolean; summaryMode: boolean; translationEnabled: boolean;
+    contextPrompt: string; transcriptionPrompts: Record<number, string | null>;
     sessionId: string; sessionName: string;
   }>>({
-    file: { transcript: "", originalTranscript: "", enhancedTranscript: "", summaryText: "", notesText: "", notesMode: false, notesStyle: "meeting", notesTranslations: {}, summaryTranslationLive: false, translations: {}, summaryTranslations: {}, questionMessages: [], activeLanguage: "Original", completed: false, summaryMode: false, translationEnabled: false, sessionId: "", sessionName: "Transcript" },
-    online: { transcript: "", originalTranscript: "", enhancedTranscript: "", summaryText: "", notesText: "", notesMode: false, notesStyle: "meeting", notesTranslations: {}, summaryTranslationLive: false, translations: {}, summaryTranslations: {}, questionMessages: [], activeLanguage: "Original", completed: false, summaryMode: false, translationEnabled: false, sessionId: "", sessionName: "Transcript" },
-    system: { transcript: "", originalTranscript: "", enhancedTranscript: "", summaryText: "", notesText: "", notesMode: false, notesStyle: "meeting", notesTranslations: {}, summaryTranslationLive: false, translations: {}, summaryTranslations: {}, questionMessages: [], activeLanguage: "Original", completed: false, summaryMode: false, translationEnabled: false, sessionId: "", sessionName: "Transcript" },
+    file: { transcript: "", originalTranscript: "", enhancedTranscript: "", summaryText: "", notesText: "", notesMode: false, notesStyle: "meeting", notesTranslations: {}, summaryTranslationLive: false, translations: {}, summaryTranslations: {}, questionMessages: [], activeLanguage: "Original", completed: false, summaryMode: false, translationEnabled: false, contextPrompt: "", transcriptionPrompts: {}, sessionId: "", sessionName: "Transcript" },
+    online: { transcript: "", originalTranscript: "", enhancedTranscript: "", summaryText: "", notesText: "", notesMode: false, notesStyle: "meeting", notesTranslations: {}, summaryTranslationLive: false, translations: {}, summaryTranslations: {}, questionMessages: [], activeLanguage: "Original", completed: false, summaryMode: false, translationEnabled: false, contextPrompt: "", transcriptionPrompts: {}, sessionId: "", sessionName: "Transcript" },
+    system: { transcript: "", originalTranscript: "", enhancedTranscript: "", summaryText: "", notesText: "", notesMode: false, notesStyle: "meeting", notesTranslations: {}, summaryTranslationLive: false, translations: {}, summaryTranslations: {}, questionMessages: [], activeLanguage: "Original", completed: false, summaryMode: false, translationEnabled: false, contextPrompt: "", transcriptionPrompts: {}, sessionId: "", sessionName: "Transcript" },
   });
 
   function switchSourceMode(next: "file" | "online" | "system") {
     if (next === sourceMode) return;
     transcriptTabs.current[sourceMode] = {
       transcript, originalTranscript, enhancedTranscript, summaryText, notesText, notesMode, notesStyle, notesTranslations, summaryTranslationLive, translations, summaryTranslations, questionMessages, activeLanguage, completed, summaryMode, translationEnabled,
+      contextPrompt: transcriptionContextPrompt, transcriptionPrompts,
       sessionId: transcriptSessionId.current, sessionName: transcriptSessionName.current,
     };
     const saved = transcriptTabs.current[next];
@@ -351,6 +359,9 @@ export default function App() {
     setCompleted(saved.completed);
     setSummaryMode(saved.summaryMode);
     setTranslationEnabled(saved.translationEnabled);
+    setTranscriptionContextPrompt(saved.contextPrompt);
+    setTranscriptionPrompts(saved.transcriptionPrompts);
+    sourceModeRef.current = next;
     setSourceMode(next);
     if (next !== "system") {
       const task = transcriptionTasks.current[next];
@@ -358,10 +369,30 @@ export default function App() {
     }
   }
 
+  function updateContextPrompt(slot: SourceMode, value: string) {
+    transcriptTabs.current[slot].contextPrompt = value;
+    if (sourceModeRef.current === slot) setTranscriptionContextPrompt(value);
+  }
+
+  function clearPromptHistory(slot: SourceMode) {
+    transcriptTabs.current[slot].transcriptionPrompts = {};
+    if (sourceModeRef.current === slot) setTranscriptionPrompts({});
+  }
+
+  function rememberPrompt(slot: SourceMode, chunk: number, prompt: string | null) {
+    transcriptTabs.current[slot].transcriptionPrompts = {
+      ...transcriptTabs.current[slot].transcriptionPrompts,
+      [chunk]: prompt,
+    };
+    if (sourceModeRef.current === slot) {
+      setTranscriptionPrompts((current) => ({ ...current, [chunk]: prompt }));
+    }
+  }
+
   function startTranscriptSession(name: string) {
     transcriptSessionId.current = crypto.randomUUID();
     transcriptSessionName.current = name || "Transcript";
-    setTranscriptionPrompts({});
+    clearPromptHistory(sourceModeRef.current);
     transcriptAttempts.current = {};
     liveTranscriptAttempt.current = 0;
     liveFinalTranscript.current = "";
@@ -489,34 +520,44 @@ export default function App() {
     return localImporting || transcriptionBusyBySlot.file || (sourceMode === "file" && (summaryGenerating || summaryTranslating || translating || questionBusy || enhancementRunning));
   }
 
-  function recordTechnicalLog(category: string, message: string) {
+  function recordTechnicalLog(category: string, message: string, slot: SourceMode = sourceModeRef.current) {
     const signature = `${category}\n${message}`;
     const nowMs = Date.now();
-    const previous = lastTechnicalLogRef.current;
+    const previous = lastTechnicalLogRefs.current[slot];
     if (previous?.signature === signature && nowMs - previous.at < 1_500) return;
-    lastTechnicalLogRef.current = { signature, at: nowMs };
-    let task = technicalTaskRef.current;
+    lastTechnicalLogRefs.current[slot] = { signature, at: nowMs };
+    let task = technicalTaskRefs.current[slot];
     if (!task) {
       const now = new Date();
       const timestampId = now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
       task = { id: `${timestampId}_${crypto.randomUUID().slice(0, 8)}`, name: category };
-      technicalTaskRef.current = task;
-      setTechnicalTaskName(task.name);
-      setTechnicalLogs([]);
+      technicalTaskRefs.current[slot] = task;
+      setTechnicalTaskNamesBySlot((current) => ({ ...current, [slot]: task!.name }));
+      setTechnicalLogsBySlot((current) => ({ ...current, [slot]: [] }));
     }
     const entry: TechnicalLogEntry = { taskId: task.id, taskName: task.name, timestamp: new Date().toISOString(), category, message };
-    setTechnicalLogs((current) => [...current, entry].slice(-100));
+    setTechnicalLogsBySlot((current) => ({ ...current, [slot]: [...current[slot], entry].slice(-100) }));
     void invoke("append_technical_log", { entry }).catch(() => undefined);
   }
 
-  function startTechnicalTask(name: string) {
+  function startTechnicalTask(name: string, slot: SourceMode = sourceModeRef.current) {
     const now = new Date();
     const timestampId = now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
-    technicalTaskRef.current = { id: `${timestampId}_${crypto.randomUUID().slice(0, 8)}`, name };
-    lastTechnicalLogRef.current = null;
-    setTechnicalTaskName(name);
-    setTechnicalLogs([]);
-    recordTechnicalLog("Task", "Started.");
+    technicalTaskRefs.current[slot] = { id: `${timestampId}_${crypto.randomUUID().slice(0, 8)}`, name };
+    lastTechnicalLogRefs.current[slot] = null;
+    setTechnicalTaskNamesBySlot((current) => ({ ...current, [slot]: name }));
+    setTechnicalLogsBySlot((current) => ({ ...current, [slot]: [] }));
+    recordTechnicalLog("Task", "Started.", slot);
+  }
+
+  function setCompactPreference(value: boolean) {
+    if (systemRecording || liveRecording || systemStopping || liveStopping) setCompactChangeDeferred(true);
+    setCompactEnabled(value);
+  }
+
+  function updateNotesPending(delta: 1 | -1) {
+    notesUpdatesPending.current = Math.max(0, notesUpdatesPending.current + delta);
+    setNotesUpdating(notesUpdatesPending.current > 0);
   }
 
   function openSavedTranscript(item: SavedTranscript) {
@@ -589,8 +630,11 @@ export default function App() {
       summaryTranslations: savedSummaryTranslations,
       questionMessages: [],
       activeLanguage: isEnhanced ? "Enhanced" : isTranslation ? selectedTranslationLanguage ?? "Original" : "Original", completed: true, summaryMode: showingSummary, notesText: notesTextForSession, notesMode: false, notesStyle: loadedNotesStyle, notesTranslations: savedNotesTranslations, summaryTranslationLive: false, translationEnabled: false,
+      contextPrompt: "", transcriptionPrompts: {},
       sessionId: transcriptSessionId.current, sessionName: transcriptSessionName.current,
     };
+    updateContextPrompt(sourceModeRef.current, "");
+    clearPromptHistory(sourceModeRef.current);
   }
 
   async function importLocalFile(path: string, append = false) {
@@ -619,10 +663,10 @@ export default function App() {
         await inspectAudio(extracted, append);
         setPhase("Extracted audio is saved in Minefia · ready to transcribe");
       } else if (ready) setPhase("Using the original local file · ready to transcribe");
-      recordTechnicalLog("Local media", "File preparation completed.");
+      recordTechnicalLog("Local media", "File preparation completed.", "file");
     } catch (cause) {
       setError(errorMessage(cause));
-      recordTechnicalLog("Local media", `Preparation failed: ${errorMessage(cause)}`);
+      recordTechnicalLog("Local media", `Preparation failed: ${errorMessage(cause)}`, "file");
     } finally {
       setLocalImporting(false);
       setProgress(0);
@@ -654,6 +698,9 @@ export default function App() {
     const language = targetLanguageRef.current === "Other" ? customLanguageRef.current.trim() : targetLanguageRef.current;
     const modelId = summaryTranslationModelRef.current;
     if (!text.trim() || !language || !["gpt-6-luna", "gpt-6.1-sol"].includes(modelId)) return;
+    const taskSlot = sourceModeRef.current;
+    translationLogSlotRef.current = taskSlot;
+    recordTechnicalLog("Summary translation", `Started · ${language}.`, taskSlot);
     const key = `${language} · ${modelId}`;
     setSummaryTranslating(true);
     setSummaryTranslations((current) => ({ ...current, [key]: "" }));
@@ -676,6 +723,8 @@ export default function App() {
   function queueRunningNotes(text: string) {
     const addition = text.trim();
     if (!addition || !summaryModeRef.current || (sourceModeRef.current !== "system" && !completedRef.current)) return;
+    summaryLogSlotRef.current = sourceModeRef.current;
+    updateNotesPending(1);
     summaryQueue.current = summaryQueue.current.then(async () => {
       const notes = await invoke<string>("update_summary_notes", {
         previousNotes: summaryTextRef.current,
@@ -695,12 +744,14 @@ export default function App() {
       const liveLanguage = targetLanguageRef.current === "Other" ? customLanguageRef.current.trim() : targetLanguageRef.current;
       const liveModel = summaryTranslationModelRef.current;
       if (summaryTranslationLiveRef.current && liveLanguage && ["gpt-6-luna", "gpt-6.1-sol"].includes(liveModel)) await translateRunningSummary(notes);
-    }).catch((cause) => { setError(`Running notes failed: ${errorMessage(cause)}`); });
+    }).catch((cause) => { setError(`Running notes failed: ${errorMessage(cause)}`); }).finally(() => updateNotesPending(-1));
   }
 
   function queueMeetingNotes(text: string) {
     const addition = text.trim();
     if (!addition || !notesModeRef.current || (sourceModeRef.current !== "system" && !completedRef.current)) return;
+    summaryLogSlotRef.current = sourceModeRef.current;
+    updateNotesPending(1);
     summaryQueue.current = summaryQueue.current.then(async () => {
       const selectedNotesStyle = notesStyleRef.current;
       const notes = await invoke<string>("update_summary_notes", { previousNotes: notesTextRef.current, newTranscript: addition, model: summaryModelRef.current, noteStyle: selectedNotesStyle });
@@ -708,13 +759,72 @@ export default function App() {
       setNotesText(notes);
       await invoke("save_transcript_notes", { sessionId: transcriptSessionId.current, name: transcriptSessionName.current, text: notes, noteStyle: selectedNotesStyle });
       await refreshSavedTranscripts();
-    }).catch((cause) => setError(`Notes update failed: ${errorMessage(cause)}`));
+    }).catch((cause) => setError(`Notes update failed: ${errorMessage(cause)}`)).finally(() => updateNotesPending(-1));
+  }
+
+  async function generateFinalNotesForSlot(slot: SourceMode, text: string, style: "meeting" | "study") {
+    const tab = transcriptTabs.current[slot];
+    if (!text.trim() || !tab.sessionId) return;
+    updateNotesPending(1);
+    recordTechnicalLog("Notes", `Generating detailed ${style === "study" ? "study notes" : "meeting minutes"} from the completed transcript.`, slot);
+    try {
+      const notes = await invoke<string>("generate_final_notes", {
+        text,
+        model: summaryModelRef.current,
+        noteStyle: style,
+      });
+      tab.notesText = notes;
+      tab.notesStyle = style;
+      if (sourceModeRef.current === slot) {
+        notesTextRef.current = notes;
+        setNotesText(notes);
+      }
+      await invoke("save_transcript_notes", {
+        sessionId: tab.sessionId,
+        name: tab.sessionName,
+        text: notes,
+        noteStyle: style,
+      });
+      await refreshSavedTranscripts();
+      recordTechnicalLog("Notes", "Detailed notes completed; interim notes replaced.", slot);
+    } catch (cause) {
+      recordTechnicalLog("Notes", `Final notes failed; interim notes were kept: ${errorMessage(cause)}`, slot);
+      if (sourceModeRef.current === slot) setError(`Final notes failed; interim notes were kept: ${errorMessage(cause)}`);
+    } finally {
+      updateNotesPending(-1);
+    }
+  }
+
+  function finishSystemNotesAfterPendingUpdates() {
+    const pending = summaryQueue.current;
+    void pending.then(async () => {
+      const tab = transcriptTabs.current.system;
+      if (tab.notesMode) {
+        await generateFinalNotesForSlot("system", systemCommittedTranscript.current || tab.transcript, tab.notesStyle);
+      }
+    }).finally(() => {
+      transcriptTabs.current.system.notesMode = false;
+      if (sourceModeRef.current === "system") {
+        notesModeRef.current = false;
+        setNotesMode(false);
+      }
+    });
   }
 
   function startNotes() {
+    const slot = sourceModeRef.current;
     setNotesMode(true);
     notesModeRef.current = true;
-    if (transcriptRef.current.trim()) queueMeetingNotes(transcriptRef.current);
+    transcriptTabs.current[slot].notesMode = true;
+    if (completedRef.current && transcriptRef.current.trim()) {
+      void generateFinalNotesForSlot(slot, transcriptRef.current, notesStyleRef.current).finally(() => {
+        transcriptTabs.current[slot].notesMode = false;
+        if (sourceModeRef.current === slot) {
+          notesModeRef.current = false;
+          setNotesMode(false);
+        }
+      });
+    } else if (transcriptRef.current.trim()) queueMeetingNotes(transcriptRef.current);
   }
 
   function chooseNotesStyle(style: "meeting" | "study") {
@@ -735,7 +845,10 @@ export default function App() {
     const language = targetLanguage === "Other" ? customLanguage.trim() : targetLanguage;
     if (!notesText.trim() || !language || !selectedTranscriptTranslationModel || notesTranslating) return;
     setNotesTranslating(true);
-    startTechnicalTask(`Notes translation ${language}`);
+    const taskSlot = sourceModeRef.current;
+    translationLogSlotRef.current = taskSlot;
+    recordTechnicalLog("Notes translation", `Started · ${language}.`, taskSlot);
+    recordTechnicalLog("Model", `Selected ${transcriptTranslationModel}.`, taskSlot);
     try {
       const translated = await invoke<string>("translate_transcript", {
         text: notesText,
@@ -753,7 +866,7 @@ export default function App() {
       await refreshSavedTranscripts();
     } catch (cause) {
       setError(`Notes translation failed: ${errorMessage(cause)}`);
-      recordTechnicalLog("Notes translation", `Failed: ${errorMessage(cause)}`);
+      recordTechnicalLog("Notes translation", `Failed: ${errorMessage(cause)}`, taskSlot);
     } finally {
       setNotesTranslating(false);
     }
@@ -761,7 +874,9 @@ export default function App() {
 
   async function generateFinalSummary(text: string) {
     if (!text.trim()) return;
-    startTechnicalTask("Transcript summary");
+    const taskSlot = sourceModeRef.current;
+    summaryLogSlotRef.current = taskSlot;
+    recordTechnicalLog("Summary", `Started · full transcript · ${summaryModelRef.current}.`, taskSlot);
     await summaryQueue.current;
     setSummaryGenerating(true);
     setSummaryStatus("started");
@@ -782,7 +897,7 @@ export default function App() {
     } catch (cause) {
       setSummaryStatus("failed");
       setError(`Summary failed: ${errorMessage(cause)}`);
-      recordTechnicalLog("Summary", `Failed: ${errorMessage(cause)}`);
+      recordTechnicalLog("Summary", `Failed: ${errorMessage(cause)}`, taskSlot);
     } finally {
       setSummaryGenerating(false);
     }
@@ -792,6 +907,10 @@ export default function App() {
     if (!summaryText.trim() || !selectedSummaryTranslationModel || !requestedTargetLanguage) return;
     const key = `${requestedTargetLanguage} · ${selectedSummaryTranslationModel.name}`;
     if (!force && summaryTranslations[key]) return;
+    const taskSlot = sourceModeRef.current;
+    translationLogSlotRef.current = taskSlot;
+    recordTechnicalLog("Summary translation", `Started · ${requestedTargetLanguage}.`, taskSlot);
+    recordTechnicalLog("Model", `Selected ${summaryTranslationModel}.`, taskSlot);
     setSummaryTranslating(true);
     setSummaryTranslationDraft("");
     setSummaryTranslations((current) => ({ ...current, [key]: "" }));
@@ -882,7 +1001,7 @@ export default function App() {
       await refreshSavedTranscripts();
       return enhanced;
     } catch (cause) {
-      recordTechnicalLog("Transcript review", `Failed: ${errorMessage(cause)}`);
+      recordTechnicalLog("Transcript review", `Failed: ${errorMessage(cause)}`, sourceModeRef.current);
       if (transcriptSessionId.current === sessionId) {
         setError(`Transcript review failed; the original transcript was kept. ${errorMessage(cause)}`);
         setPhase("Transcript review failed · original retained");
@@ -968,7 +1087,7 @@ export default function App() {
     const unlistenEvent = listen<TranscriptionEvent>("transcription-progress", ({ payload }) => {
       if (payload.taskSlot === "system") {
         if (payload.kind === "prompt") {
-          setTranscriptionPrompts((current) => ({ ...current, [payload.chunk ?? 0]: payload.prompt ?? null }));
+          rememberPrompt("system", payload.chunk ?? 0, payload.prompt ?? null);
         } else if (payload.kind === "delta" && payload.chunk && payload.delta) {
           systemStreamedParts.current[payload.chunk] = (systemStreamedParts.current[payload.chunk] ?? "") + payload.delta;
           renderSystemTranscriptPreview();
@@ -986,7 +1105,7 @@ export default function App() {
       }
       if (["preparing", "retrying", "chunk_done", "done", "error"].includes(payload.kind)) {
         const part = payload.chunk ? ` · part ${payload.chunk}${payload.totalChunks ? `/${payload.totalChunks}` : ""}` : "";
-        recordTechnicalLog(`Transcription · ${payload.taskSlot}`, `${payload.kind}${part}${payload.code ? ` · [${payload.code}]` : ""}${payload.message ? ` · ${payload.message}` : ""}`);
+        recordTechnicalLog(`Transcription · ${payload.taskSlot}`, `${payload.kind}${part}${payload.code ? ` · [${payload.code}]` : ""}${payload.message ? ` · ${payload.message}` : ""}`, payload.taskSlot);
       }
       const renderTask = () => {
         const ordered: string[] = [];
@@ -1008,7 +1127,7 @@ export default function App() {
         return text;
       };
       if (payload.kind === "prompt") {
-        if (isVisibleTask) setTranscriptionPrompts((current) => ({ ...current, [payload.chunk ? globalChunk : 0]: payload.prompt ?? null }));
+        rememberPrompt(payload.taskSlot, payload.chunk ? globalChunk : 0, payload.prompt ?? null);
       } else if (payload.kind === "preparing") {
         task.phase = `File ${task.fileIndex}/${task.fileCount} · ${payload.message ?? "Preparing audio"}`;
         task.progress = 12;
@@ -1071,7 +1190,7 @@ export default function App() {
         ? ` · ${formatBytes(payload.downloadedBytes)}${payload.totalBytes ? ` / ${formatBytes(payload.totalBytes)}` : " received"}`
         : payload.total > 0 ? ` · ${payload.completed}/${payload.total} parts` : "";
       if (shouldLog) {
-        recordTechnicalLog("Download", `${payload.stage}: ${payload.message}${byteDetails}`);
+        recordTechnicalLog("Download", `${payload.stage}: ${payload.message}${byteDetails}`, "online");
         lastLoggedDownloadProgress.current = {
           stage: payload.stage,
           bytes: payload.downloadedBytes ?? previous.bytes,
@@ -1098,8 +1217,8 @@ export default function App() {
     });
 
     const unlistenTranslation = listen<TranslationEvent>("translation-progress", ({ payload }) => {
-      if (payload.kind === "done") { recordTechnicalLog("Translation", `Completed ${payload.totalChunks} part(s).`); void refreshUsage(); }
-      if (payload.kind === "prompt_cache" && payload.cachedTokens) recordTechnicalLog("Prompt caching", `Used · ${payload.cachedTokens.toLocaleString()} cached input tokens (${payload.chunk}/${payload.totalChunks}).`);
+      if (payload.kind === "done") { recordTechnicalLog("Translation", `Completed ${payload.totalChunks} part(s).`, translationLogSlotRef.current); void refreshUsage(); }
+      if (payload.kind === "prompt_cache" && payload.cachedTokens) recordTechnicalLog("Prompt caching", `Used · ${payload.cachedTokens.toLocaleString()} cached input tokens (${payload.chunk}/${payload.totalChunks}).`, translationLogSlotRef.current);
       const language = translatingLanguage.current;
       if (payload.kind === "delta" && payload.delta && language) {
         if (language.startsWith("summary:")) {
@@ -1111,8 +1230,9 @@ export default function App() {
     });
 
     const unlistenSystemAudio = listen<SystemAudioEvent>("system-audio-progress", ({ payload }) => {
-      if (["warning", "error", "done", "capture_stopped"].includes(payload.kind)) {
-        recordTechnicalLog("Audio capture", `${payload.kind}${payload.chunk ? ` · part ${payload.chunk}` : ""}${payload.code ? ` · [${payload.code}]` : ""}${payload.message ? ` · ${payload.message}` : ""}`);
+      if (["warning", "error", "done", "capture_stopped", "final_chunk_queued"].includes(payload.kind)) {
+        const detail = payload.kind === "done" ? ` · ${payload.completedChunks} part(s) processed` : "";
+        recordTechnicalLog("Audio capture", `${payload.kind}${payload.chunk ? ` · part ${payload.chunk}` : ""}${detail}${payload.code ? ` · [${payload.code}]` : ""}${payload.message ? ` · ${payload.message}` : ""}`, "system");
       }
       if (sourceModeRef.current !== "system") {
         if (payload.kind === "transcript" && payload.text !== undefined) {
@@ -1131,6 +1251,8 @@ export default function App() {
           tab.summaryMode = false;
           setSystemRecording(false);
           setSystemStopping(false);
+          setCompactChangeDeferred(false);
+          finishSystemNotesAfterPendingUpdates();
           return;
         }
         if (payload.kind !== "error" && payload.kind !== "warning") return;
@@ -1159,7 +1281,7 @@ export default function App() {
       } else if (payload.kind === "warning") {
         setSystemWarning(payload.message ?? "A chunk was force-split without silence.");
       } else if (payload.kind === "transcript" && payload.text !== undefined) {
-        recordTechnicalLog("Audio capture", `Part ${payload.completedChunks} transcribed; ${payload.queuedChunks} queued, ${payload.activeRequests} active.`);
+        recordTechnicalLog("Audio capture", `Part ${payload.completedChunks} transcribed; ${payload.queuedChunks} queued, ${payload.activeRequests} active.`, "system");
         commitSystemTranscriptChunk(payload.chunk ?? payload.completedChunks, payload.text, payload.completedChunks);
         transcriptRef.current = systemCommittedTranscript.current;
         persistTranscriptFragment(payload.chunk ?? systemCompletedChunksRef.current, payload.text);
@@ -1174,19 +1296,24 @@ export default function App() {
         systemCaptureFinalized.current = true;
         setSystemRecording(false);
         setSystemStopping(false);
+        setCompactChangeDeferred(false);
+        setSystemCompletedChunks(payload.completedChunks);
+        setSystemQueuedChunks(0);
+        setSystemActiveRequests(0);
         setCompleted(true);
         setProgress(100);
         setPhase("System audio transcription complete");
         snapshotTranscriptFile();
         cleanupSavedTranscriptChunks();
         if (summaryModeRef.current) void generateFinalSummary(transcriptRef.current);
+        finishSystemNotesAfterPendingUpdates();
         void transcriptPersistenceQueue.current.then(refreshSavedTranscripts);
       }
     });
 
     const unlistenRealtime = listen<RealtimeAudioEvent>("realtime-audio-progress", ({ payload }) => {
       if (["reconnecting", "error", "done"].includes(payload.kind)) {
-        recordTechnicalLog("Live audio", `${payload.kind}${payload.code ? ` · [${payload.code}]` : ""}${payload.message ? ` · ${payload.message}` : ""}`);
+        recordTechnicalLog("Live audio", `${payload.kind}${payload.code ? ` · [${payload.code}]` : ""}${payload.message ? ` · ${payload.message}` : ""}`, "system");
       }
       if (sourceModeRef.current !== "system") {
         const tab = transcriptTabs.current.system;
@@ -1200,6 +1327,8 @@ export default function App() {
           tab.completed = true;
           setLiveRecording(false);
           setLiveStopping(false);
+          setCompactChangeDeferred(false);
+          finishSystemNotesAfterPendingUpdates();
           return;
         }
         if (payload.kind !== "error") return;
@@ -1235,19 +1364,21 @@ export default function App() {
       if (payload.kind === "done") {
         setLiveRecording(false);
         setLiveStopping(false);
+        setCompactChangeDeferred(false);
         setCompleted(true);
         setProgress(100);
         setPhase("Live transcription complete");
         snapshotTranscriptFile();
         cleanupSavedTranscriptChunks();
         if (summaryModeRef.current) void generateFinalSummary(transcriptRef.current);
+        finishSystemNotesAfterPendingUpdates();
         void transcriptPersistenceQueue.current.then(refreshSavedTranscripts);
       }
     });
 
     const unlistenSummary = listen<SummaryEvent>("summary-progress", ({ payload }) => {
-      if (payload.kind === "start" || payload.kind === "done") recordTechnicalLog("Summary", `${payload.mode} ${payload.kind}.`);
-      if (payload.kind === "prompt_cache" && payload.cachedTokens) recordTechnicalLog("Prompt caching", `Used · ${payload.cachedTokens.toLocaleString()} cached input tokens (${payload.mode}).`);
+      if (payload.kind === "start" || payload.kind === "done") recordTechnicalLog("Summary", `${payload.mode} ${payload.kind}.`, summaryLogSlotRef.current);
+      if (payload.kind === "prompt_cache" && payload.cachedTokens) recordTechnicalLog("Prompt caching", `Used · ${payload.cachedTokens.toLocaleString()} cached input tokens (${payload.mode}).`, summaryLogSlotRef.current);
       if (payload.kind === "done") void refreshUsage();
       if (payload.mode === "question" && payload.kind === "delta" && payload.delta) {
         setQuestionDraft((current) => current + payload.delta);
@@ -1257,7 +1388,7 @@ export default function App() {
     });
     const unlistenInputLevel = listen<number>("audio-input-level", ({ payload }) => setInputLevel(Math.max(0, Math.min(1, payload))));
     const unlistenCaptureFormat = listen<{ source: string; sampleRate: number; channels: number; targetSampleRate: number; targetChannels: number; captureEncoding: string }>("audio-capture-format", ({ payload }) => {
-      recordTechnicalLog("Audio capture", `Microphone input: ${payload.sampleRate / 1000} kHz / ${payload.channels} ch → ${payload.targetSampleRate / 1000} kHz mono ${payload.captureEncoding}.`);
+      recordTechnicalLog("Audio capture", `Microphone input: ${payload.sampleRate / 1000} kHz / ${payload.channels} ch → ${payload.targetSampleRate / 1000} kHz mono ${payload.captureEncoding}.`, "system");
     });
     const unlistenSavedCaptures = listen<string[]>("audio-recordings-saved", ({ payload }) => {
       const newestRecording = payload.at(-1);
@@ -1399,6 +1530,8 @@ export default function App() {
   const selectedTranscriptTranslationModel = availableTranslationModels.find((item) => item.id === transcriptTranslationModel);
   const selectedSummaryTranslationModel = availableTranslationModels.find((item) => item.id === summaryTranslationModel);
   const selectedQuestionModel = availableTranslationModels.find((item) => item.id === questionModel);
+  const summaryModelLocked = summaryGenerating || notesUpdating || ((systemRecording || liveRecording || systemStopping || liveStopping)
+    && (summaryMode || notesMode || transcriptTabs.current.system.summaryMode || transcriptTabs.current.system.notesMode));
   const translationEstimate = estimateTranslationCost(transcriptTranslationModel, transcript);
   const summaryEstimate = estimateTranslationCost(translationModel, summaryText || transcript);
   const summaryTranslationEstimate = estimateTranslationCost(summaryTranslationModel, summaryText);
@@ -1444,7 +1577,7 @@ export default function App() {
       setTranscript("");
       setOriginalTranscript("");
       setEnhancedTranscript("");
-      setTranscriptionContextPrompt("");
+      updateContextPrompt("file", "");
       transcriptRef.current = "";
       liveFinalTranscript.current = "";
       livePersistedTranscript.current = "";
@@ -1549,7 +1682,7 @@ export default function App() {
     startTechnicalTask(classifyOnlineUrl(url) === "web" ? "Web page inspection" : "Online media inspection");
     setError("");
     setProgress(0);
-    setTranscriptionPrompts({});
+    clearPromptHistory("online");
     if (audioOwner === "online") setAudio(null);
     setTranscript("");
     setOriginalTranscript("");
@@ -1577,7 +1710,7 @@ export default function App() {
     setCompleted(false);
     transcriptSessionId.current = "";
     transcriptSessionName.current = "Transcript";
-    setTranscriptionContextPrompt("");
+    updateContextPrompt("online", "");
     transcriptTabs.current.online = {
       ...transcriptTabs.current.online,
       transcript: "", originalTranscript: "", enhancedTranscript: "", summaryText: "", notesText: "",
@@ -1597,7 +1730,7 @@ export default function App() {
         setWebPageInspecting(true);
         const info = await invoke<PageMediaInfo>("inspect_web_page", { url, headlessMode: headlessBrowser });
         setWebPageInfo(info);
-        setTranscriptionContextPrompt(info.pageTitle.trim() ? `Title: ${info.pageTitle.trim()}` : "");
+        updateContextPrompt("online", info.pageTitle.trim() ? `Title: ${info.pageTitle.trim()}` : "");
         setOnlineInputKind("web");
         setProgress(100);
         setPhase("Page inspected · choose a loaded audio or video source");
@@ -1606,7 +1739,7 @@ export default function App() {
           const media = await invoke<OnlineMediaInfo>("inspect_online_media", { url, headlessMode: headlessBrowser });
           setOnlineMedia(media);
           setSelectedOnlineCaptionId(media.captions[0]?.id ?? "");
-          setTranscriptionContextPrompt([
+          updateContextPrompt("online", [
             media.title.trim() ? `Title: ${media.title.trim()}` : "",
             media.description?.trim() ? `Description: ${media.description.trim().slice(0, 700)}` : "",
           ].filter(Boolean).join("\n"));
@@ -1621,7 +1754,7 @@ export default function App() {
           setPhase("Checking the page for media that is currently loaded");
           const info = await invoke<PageMediaInfo>("inspect_web_page", { url, headlessMode: headlessBrowser });
           setWebPageInfo(info);
-          setTranscriptionContextPrompt(info.pageTitle.trim() ? `Title: ${info.pageTitle.trim()}` : "");
+          updateContextPrompt("online", info.pageTitle.trim() ? `Title: ${info.pageTitle.trim()}` : "");
           setOnlineInputKind("web");
           setProgress(100);
           setPhase("Page inspected · choose a loaded audio or video source");
@@ -1629,7 +1762,7 @@ export default function App() {
       }
     } catch (cause) {
       const message = errorMessage(cause);
-      recordTechnicalLog("Online media", `Inspection failed: ${message}`);
+      recordTechnicalLog("Online media", `Inspection failed: ${message}`, "online");
       setError(message.includes("MASTER_PLAYLIST_NOT_FOUND")
         ? "A blob video was found, but no master.m3u8 playlist appeared in the observed network traffic."
         : message.includes("WEB_MEDIA_NOT_FOUND")
@@ -1664,7 +1797,7 @@ export default function App() {
     setProgress(8);
     setPhase(`Loading ${caption.label}`);
     startTechnicalTask("Online caption transcript");
-    recordTechnicalLog("Caption", `Using ${caption.label} as the transcript source.`);
+    recordTechnicalLog("Caption", `Using ${caption.label} as the transcript source.`, "online");
     try {
       const text = await invoke<string>("download_online_caption", {
         url: media.url,
@@ -1708,13 +1841,13 @@ export default function App() {
       await refreshSavedTranscripts();
       setProgress(100);
       setPhase(`Caption transcript ready · ${caption.label}`);
-      recordTechnicalLog("Caption", `Transcript saved to Library · ${text.length.toLocaleString()} characters.`);
+      recordTechnicalLog("Caption", `Transcript saved to Library · ${text.length.toLocaleString()} characters.`, "online");
     } catch (cause) {
       const message = errorMessage(cause);
       setError(`Could not use the selected caption: ${message}`);
       setProgress(0);
       setPhase("Caption transcript could not be created");
-      recordTechnicalLog("Caption", `Failed: ${message}`);
+      recordTechnicalLog("Caption", `Failed: ${message}`, "online");
     } finally {
       setOnlineCaptionLoading(false);
     }
@@ -1732,8 +1865,8 @@ export default function App() {
     setOnlineCancelRequested(false);
     setOnlineDownloadProgress(null);
     lastLoggedDownloadProgress.current = { stage: "", bytes: 0, partMark: -1, percentMark: -1 };
-    recordTechnicalLog("Download", `Source: ${onlineMedia.title}`);
-    recordTechnicalLog("Download", "Preserving the selected source audio codec without re-encoding.");
+    recordTechnicalLog("Download", `Source: ${onlineMedia.title}`, "online");
+    recordTechnicalLog("Download", "Preserving the selected source audio codec without re-encoding.", "online");
     setOnlineExtracting(true);
     setProgress(2);
     setPhase("Preparing the download");
@@ -1744,7 +1877,7 @@ export default function App() {
       await refreshLibraryFiles();
       setAudio(extracted);
       setAudioOwner("online");
-      setTranscriptionContextPrompt(extracted.contextPrompt ?? "");
+      updateContextPrompt("online", extracted.contextPrompt ?? "");
       setSelectedAudioStreamIndex(extracted.audioTracks[0]?.streamIndex ?? null);
       setTranscript("");
       setOriginalTranscript("");
@@ -1770,11 +1903,11 @@ export default function App() {
         // A canceled extraction returns to the inspected-media state; don't leave a stale percent behind.
         setProgress(0);
         setOnlineDownloadProgress(null);
-        recordTechnicalLog("Download", "Canceled by user; resumable download data kept.");
+        recordTechnicalLog("Download", "Canceled by user; resumable download data kept.", "online");
         setPhase("Media inspected · audio stream confirmed");
       } else {
         setError(message);
-        recordTechnicalLog("Download", `Failed: ${message}`);
+        recordTechnicalLog("Download", `Failed: ${message}`, "online");
         setPhase("Audio extraction failed");
       }
     } finally {
@@ -1791,7 +1924,7 @@ export default function App() {
     catch (cause) {
       const message = onlineErrorMessage(cause);
       setError(message);
-      recordTechnicalLog("Download", `Cancel failed: ${message}`);
+      recordTechnicalLog("Download", `Cancel failed: ${message}`, "online");
     }
   }
 
@@ -1844,7 +1977,7 @@ export default function App() {
     const taskId = crypto.randomUUID();
     const sources = taskSlot === "file" && audioQueue.length ? audioQueue : [audio];
     startTechnicalTask(sources.length > 1 ? `Transcription · ${sources.length} audio files` : `Transcription ${audio.name}`);
-    recordTechnicalLog(`Model · ${taskSlot}`, `Selected ${model}.`);
+    recordTechnicalLog(`Model · ${taskSlot}`, `Selected ${model}.`, taskSlot);
     setTranscriptionBusyBySlot((current) => ({ ...current, [taskSlot]: true }));
     setTranscriptionCancelBySlot((current) => ({ ...current, [taskSlot]: false }));
     setCompleted(false);
@@ -1918,7 +2051,7 @@ export default function App() {
       await refreshResumableJobs();
     } catch (cause) {
       const message = errorMessage(cause);
-      recordTechnicalLog(`Transcription · ${taskSlot}`, `Failed: ${message}`);
+      recordTechnicalLog(`Transcription · ${taskSlot}`, `Failed: ${message}`, taskSlot);
       if (message.includes("REENCODE_APPROVAL_REQUIRED")) {
         task.phase = "Conversion approval required";
         task.error = message;
@@ -2038,10 +2171,11 @@ export default function App() {
     const capturePreset = CAPTURE_QUALITY_PRESETS.find((preset) => preset.key === captureQuality)!;
     const { sampleRate: captureRate, bitrate: captureBitrate, label: captureLabel } = capturePreset;
     const compactApplies = compactEnabled;
+    setCompactChangeDeferred(false);
     recordTechnicalLog(captureMode === "live" ? "Live audio" : "Audio capture", compactApplies
       ? `Selected quality: ${captureLabel} · mono AAC · ${captureRate / 1000} kHz / ${captureBitrate} kbps; encoded during capture.`
-      : `Selected quality: ${captureLabel} · mono PCM/WAV · ${captureRate / 1000} kHz; Compact is off.`);
-    if (captureMode === "live") recordTechnicalLog("Live audio", "OpenAI Realtime input: 24 kHz · 16-bit · mono PCM; saved recording keeps the selected capture quality.");
+      : `Selected quality: ${captureLabel} · mono PCM/WAV · ${captureRate / 1000} kHz; Compact is off.`, "system");
+    if (captureMode === "live") recordTechnicalLog("Live audio", "OpenAI Realtime input: 24 kHz · 16-bit · mono PCM; saved recording keeps the selected capture quality.", "system");
     if (captureMode === "standard") setSystemRecording(true);
     else setLiveRecording(true);
     try {
@@ -2052,7 +2186,8 @@ export default function App() {
       }
     } catch (cause) {
       systemCaptureFinalized.current = true;
-      recordTechnicalLog("Audio capture", `Start failed: ${errorMessage(cause)}`);
+      setCompactChangeDeferred(false);
+      recordTechnicalLog("Audio capture", `Start failed: ${errorMessage(cause)}`, "system");
       setSystemRecording(false);
       setLiveRecording(false);
       setError(errorMessage(cause));
@@ -2063,31 +2198,31 @@ export default function App() {
   async function stopSystemAudio() {
     if ((!systemRecording && !liveRecording) || systemStopping || liveStopping) return;
     if (liveRecording) {
-      recordTechnicalLog("Live audio", "Stop requested.");
+      recordTechnicalLog("Live audio", "Stop requested.", "system");
       setLiveStopping(true);
       setPhase("Finalizing live transcription");
       try {
         await invoke("stop_realtime_audio");
-        recordTechnicalLog("Live audio", "Stop signal accepted; waiting for final transcript.");
+        recordTechnicalLog("Live audio", "Stop signal accepted; waiting for final transcript.", "system");
       } catch (cause) {
         const message = errorMessage(cause);
         setLiveStopping(false);
         setError(message);
-        recordTechnicalLog("Live audio", `Stop failed: ${message}`);
+        recordTechnicalLog("Live audio", `Stop failed: ${message}`, "system");
       }
       return;
     }
-    recordTechnicalLog("Audio capture", "Stop requested.");
+    recordTechnicalLog("Audio capture", "Stop requested.", "system");
     setSystemStopping(true);
     setPhase("Finishing the remaining audio and queued chunks");
     try {
       await invoke("stop_system_audio");
-      recordTechnicalLog("Audio capture", "Stop signal accepted; waiting for queued transcription.");
+      recordTechnicalLog("Audio capture", "Stop signal accepted; waiting for queued transcription.", "system");
     } catch (cause) {
       const message = errorMessage(cause);
       setSystemStopping(false);
       setError(message);
-      recordTechnicalLog("Audio capture", `Stop failed: ${message}`);
+      recordTechnicalLog("Audio capture", `Stop failed: ${message}`, "system");
     }
   }
 
@@ -2103,8 +2238,10 @@ export default function App() {
       return;
     }
     setTranslating(true);
-    startTechnicalTask(`Translation ${requestedTargetLanguage}`);
-    recordTechnicalLog("Model", `Selected ${transcriptTranslationModel}.`);
+    const taskSlot = sourceModeRef.current;
+    translationLogSlotRef.current = taskSlot;
+    recordTechnicalLog("Translation", `Started · ${requestedTargetLanguage}.`, taskSlot);
+    recordTechnicalLog("Model", `Selected ${transcriptTranslationModel}.`, taskSlot);
     setError("");
     translatingLanguage.current = targetTranslationKey;
     setTranslations((current) => ({ ...current, [targetTranslationKey]: "" }));
@@ -2125,7 +2262,7 @@ export default function App() {
       });
       await refreshSavedTranscripts();
     } catch (cause) {
-      recordTechnicalLog("Translation", `Failed: ${errorMessage(cause)}`);
+      recordTechnicalLog("Translation", `Failed: ${errorMessage(cause)}`, taskSlot);
       setTranslations((current) => {
         const next = { ...current };
         delete next[targetTranslationKey];
@@ -2314,7 +2451,7 @@ export default function App() {
             {audio && audioOwner === "file" && <div className="transcription-prompt-card card">
               <label htmlFor="transcription-context-prompt"><div className="section-label"><FileText size={15} /><span>Transcription prompt context</span></div></label>
               <p>Optional context sent with each audio part. YouTube title and description are prefilled when available; edit them or add your own terms.</p>
-              <textarea id="transcription-context-prompt" value={transcriptionContextPrompt} onChange={(event) => setTranscriptionContextPrompt(event.target.value)} placeholder="Names, terminology, or context to help recognize the audio…" disabled={busy} rows={5} />
+              <textarea id="transcription-context-prompt" value={transcriptionContextPrompt} onChange={(event) => updateContextPrompt("file", event.target.value)} placeholder="Names, terminology, or context to help recognize the audio…" disabled={busy} rows={5} />
               <small>This is context for transcription, not an instruction to translate or summarize. The actual prompt sent is shown below after transcription starts.</small>
             </div>}
 
@@ -2380,7 +2517,7 @@ export default function App() {
               {audio && audioOwner === "online" && <div className="transcription-prompt-card card">
                 <label htmlFor="online-transcription-context-prompt"><div className="section-label"><FileText size={15} /><span>Transcription prompt context</span></div></label>
                 <p>Optional context sent with each audio part. YouTube title and description are prefilled when available; edit them or add your own terms.</p>
-                <textarea id="online-transcription-context-prompt" value={transcriptionContextPrompt} onChange={(event) => setTranscriptionContextPrompt(event.target.value)} placeholder="Names, terminology, or context to help recognize the audio…" disabled={busy} rows={5} />
+                <textarea id="online-transcription-context-prompt" value={transcriptionContextPrompt} onChange={(event) => updateContextPrompt("online", event.target.value)} placeholder="Names, terminology, or context to help recognize the audio…" disabled={busy} rows={5} />
                 <small>This is context for transcription, not an instruction to translate or summarize. The actual prompt sent is shown below after transcription starts.</small>
               </div>}
 
@@ -2499,8 +2636,8 @@ export default function App() {
               </div>
             )}
             {technicalDetails && backgroundWorkActive && <section className="technical-activity-panel" aria-live="polite">
-              <div className="technical-activity-heading"><strong>Technical details · {technicalTaskName}</strong></div>
-              {technicalLogs.length === 0 ? <p>Waiting for the next background activity…</p> : <ol>{technicalLogs.map((entry, index) => <li key={`${entry.timestamp}-${index}`}><time>{new Date(entry.timestamp).toLocaleTimeString()}</time><b>{entry.category}</b><span>{entry.message}</span></li>)}</ol>}
+              <div className="technical-activity-heading"><strong>Technical details · {technicalTaskNamesBySlot[sourceMode]}</strong></div>
+              {technicalLogsBySlot[sourceMode].length === 0 ? <p>Waiting for activity in this tab…</p> : <ol>{technicalLogsBySlot[sourceMode].map((entry, index) => <li key={`${entry.timestamp}-${index}`}><time>{new Date(entry.timestamp).toLocaleTimeString()}</time><b>{entry.category}</b><span>{entry.message}</span></li>)}</ol>}
             </section>}
             {busy && <button className="cancel-processing-button" onClick={() => void cancelTranscription()} disabled={transcriptionCancelRequested}>{transcriptionCancelRequested ? <><Loader2 className="spin" size={13} /> Canceling…</> : "Cancel processing"}</button>}
 
@@ -2575,7 +2712,7 @@ export default function App() {
             )}
 
             {(sourceMode === "system" || completed) && (completed || systemRecording || liveRecording || notesText || Object.keys(notesTranslations).length > 0 || Boolean(audio && audioOwner === sourceMode)) && <details className="summary-panel notes-panel" open>
-              <summary className="summary-panel-heading"><div><p className="eyebrow">MARKDOWN · INCREMENTAL NOTES</p><h3>{notesStyle === "study" ? "Cornell study notes" : "Meeting minutes"}</h3></div>{notesMode && <span className="summary-status-pill started"><Loader2 className="spin" size={13} /> Notes active</span>}</summary>
+              <summary className="summary-panel-heading"><div><p className="eyebrow">MARKDOWN · INCREMENTAL NOTES</p><h3>{notesStyle === "study" ? "Cornell study notes" : "Meeting minutes"}</h3></div>{notesMode ? <span className="summary-status-pill started"><Loader2 className="spin" size={13} /> Notes active</span> : notesText && completed ? <span className="summary-status-pill ended"><Check size={13} /> Notes ended</span> : null}</summary>
               <div className="summary-panel-content">
                 {!notesMode && <>
                   <div className="notes-style-options" role="group" aria-label="Notes format">
@@ -2663,7 +2800,7 @@ export default function App() {
         {error && <div className="error-toast"><CircleAlert size={18} /><span>{error}</span><button onClick={() => setError("")}><X size={16} /></button></div>}
       </main>
 
-      <SettingsModal open={settingsOpen} keys={apiKeys} adminKeys={adminApiKeys} onClose={() => setSettingsOpen(false)} onChanged={refreshSettingsKeys} parallelRequests={parallelRequests} onParallelRequestsChange={setParallelRequests} captureQuality={captureQuality} onCaptureQualityChange={setCaptureQuality} availableCaptureQualities={availableCaptureQualities} captureQualityRestrictionNote={captureQualityRestrictionNote} compactEnabled={compactEnabled} onCompactEnabledChange={setCompactEnabled} technicalErrors={technicalErrors} onTechnicalErrorsChange={setTechnicalErrors} technicalDetails={technicalDetails} onTechnicalDetailsChange={setTechnicalDetails} headlessBrowser={headlessBrowser} onHeadlessBrowserChange={setHeadlessBrowser} translationModels={availableTranslationModels} summaryModel={translationModel} onSummaryModelChange={setTranslationModel} transcriptTranslationModel={transcriptTranslationModel} onTranscriptTranslationModelChange={setTranscriptTranslationModel} summaryTranslationModel={summaryTranslationModel} onSummaryTranslationModelChange={setSummaryTranslationModel} questionModel={questionModel} onQuestionModelChange={setQuestionModel} />
+      <SettingsModal open={settingsOpen} keys={apiKeys} adminKeys={adminApiKeys} onClose={() => setSettingsOpen(false)} onChanged={refreshSettingsKeys} parallelRequests={parallelRequests} onParallelRequestsChange={setParallelRequests} captureQuality={captureQuality} onCaptureQualityChange={setCaptureQuality} availableCaptureQualities={availableCaptureQualities} captureQualityRestrictionNote={captureQualityRestrictionNote} compactEnabled={compactEnabled} onCompactEnabledChange={setCompactPreference} compactChangeDeferred={compactChangeDeferred} summaryModelLocked={summaryModelLocked} technicalErrors={technicalErrors} onTechnicalErrorsChange={setTechnicalErrors} technicalDetails={technicalDetails} onTechnicalDetailsChange={setTechnicalDetails} headlessBrowser={headlessBrowser} onHeadlessBrowserChange={setHeadlessBrowser} translationModels={availableTranslationModels} summaryModel={translationModel} onSummaryModelChange={setTranslationModel} transcriptTranslationModel={transcriptTranslationModel} onTranscriptTranslationModelChange={setTranscriptTranslationModel} summaryTranslationModel={summaryTranslationModel} onSummaryTranslationModelChange={setSummaryTranslationModel} questionModel={questionModel} onQuestionModelChange={setQuestionModel} />
       <LibraryModal
         open={libraryOpen}
         files={libraryFiles}
@@ -2673,7 +2810,7 @@ export default function App() {
         onOpenFile={(file) => {
           if (isLocalTaskBusy()) { setError("Local file is busy with another task. Wait for it to finish before opening a Library item."); return; }
           setLibraryOpen(false); switchSourceMode("file");
-          void inspectAudio(file.path).then((ready) => { if (ready) setTranscriptionContextPrompt(file.contextPrompt ?? ""); });
+          void inspectAudio(file.path).then((ready) => { if (ready) updateContextPrompt("file", file.contextPrompt ?? ""); });
         }}
         onOpenTranscript={(item) => {
           if (isLocalTaskBusy()) { setError("Local file is busy with another task. Wait for it to finish before opening a Library transcript."); return; }

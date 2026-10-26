@@ -42,6 +42,9 @@ flexaudio = "0.8.1"
 [target.'cfg(target_os = "windows")'.dependencies]
 wasapi = "0.26"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+flexaudio = "0.8.1"
+
 [profile.dev]
 debug = 1
 incremental = true

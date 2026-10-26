@@ -48,7 +48,7 @@ A Tauri desktop app that sends audio to the OpenAI Audio Transcriptions API, dis
 - A Markdown summary mode incrementally merges each new transcript chunk into running bullet notes; when recording stops, it creates a final summary from the full transcript
 - Incremental notes can use either meeting-minutes formatting or comprehensive Cornell-style university study notes, and notes can be translated and saved separately in the Library
 - Summary calls stream from the Responses API and use the selected Luna/Sol text model; the estimated summary cost is shown before enabling the extra processing
-- **System Audio · Standard Mode** captures playback audio with ScreenCaptureKit on macOS and WASAPI Loopback on Windows
+- **System Audio · Standard Mode** captures playback audio with Core Audio on macOS, WASAPI Loopback on Windows, and PipeWire on Linux
 - Standard Mode waits until 90 seconds, then splits on at least 0.5 seconds of audio at or below -35 dBFS
 - A 150-second hard limit guarantees bounded chunks and reports a force-split warning when no silence is available
 - Capture continues while up to two transcription requests run concurrently; results are restored to chunk order
@@ -78,21 +78,12 @@ A Tauri desktop app that sends audio to the OpenAI Audio Transcriptions API, dis
 
 - Node.js 20 or later
 - Stable Rust toolchain
-- FFmpeg (`ffmpeg` and `ffprobe`)
-- `yt-dlp` for YouTube support; `reqwest` downloads authorized direct/HLS media and FFmpeg is used for media probing, compatible audio extraction, and any required local conversion
+- FFmpeg (`ffmpeg` and `ffprobe`) and the GPLv3+ standalone `yt-dlp` executable are staged into the app bundle when building; users do not need to install them separately
 - Chromium is automatically installed into the app's private data directory on first Web page inspection
 - An OpenAI API key
-- macOS 13 or later, or Windows with WASAPI support, for System Audio mode
+- macOS 13 or later, Windows with WASAPI support, or a Linux desktop session with PipeWire running for System Audio mode
 
-Install FFmpeg on macOS with:
-
-```bash
-brew install ffmpeg
-```
-
-Install `yt-dlp` on macOS with `brew install yt-dlp`. YouTube changes frequently, so keep `yt-dlp` current (`brew upgrade yt-dlp`) if extraction fails. Minefia Audio reports an update hint when its YouTube extractor cannot parse a source. Minefia Audio does not bypass source access controls.
-
-If FFmpeg is outside the normal `PATH`, set `MINEFIA_FFMPEG` and `MINEFIA_FFPROBE` to the absolute binary paths.
+The packaged app uses bundled LGPL FFmpeg/ffprobe and the official GPLv3+ standalone yt-dlp build. Their license notices and build provenance are included under the app's `tools` resources. YouTube extraction can still be affected by provider changes; Minefia Audio reports an update hint when yt-dlp cannot parse a source and does not bypass source access controls. Developers may override bundled tool paths with `MINEFIA_FFMPEG`, `MINEFIA_FFPROBE`, or `MINEFIA_YT_DLP`.
 
 ## Development
 
@@ -107,9 +98,9 @@ npm run tauri dev
 npm run tauri build
 ```
 
-Production users also need FFmpeg. For a self-contained distribution, bundle an FFmpeg binary for each target platform as a Tauri sidecar and review the relevant FFmpeg licensing terms.
+`npm run tauri build` prepares the platform-specific media tools before bundling. macOS uses the LGPL-2.1-or-later FFmpeg 9.0.1 build for Apple silicon or Intel; Windows uses a checksum-verified LGPL shared FFmpeg build. yt-dlp is pinned to the official 2026.10.21 standalone release, and its downloaded artifact is checked against the release SHA-256 manifest. Bundled third-party license texts and build information are placed in the app resources.
 
-On macOS, System Audio uses ScreenCaptureKit and requires access under **System Settings → Privacy & Security → Screen & System Audio Recording**. Microphone capture requires microphone access. The app bundle includes `NSScreenCaptureUsageDescription` and `NSMicrophoneUsageDescription`; restart the app after granting permission if macOS requests it.
+On macOS, System Audio uses Core Audio Process Tap with a ScreenCaptureKit fallback and requires access under **System Settings → Privacy & Security → Screen & System Audio Recording**. On Linux, System Audio captures the default output through the PipeWire sink monitor; a running PipeWire user session is required. Microphone capture requires an available input device. The app bundle includes `NSScreenCaptureUsageDescription` and `NSMicrophoneUsageDescription`; restart the app after granting permission if macOS requests it.
 
 ## Architecture
 

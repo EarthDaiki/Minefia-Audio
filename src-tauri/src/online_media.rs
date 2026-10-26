@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::HashMap,
-    env,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -3182,7 +3181,7 @@ fn is_missing_tool(error: &OnlineMediaError) -> bool {
 
 fn yt_dlp_command() -> Command {
     let mut command =
-        Command::new(env::var_os("MINEFIA_YT_DLP").unwrap_or_else(|| "yt-dlp".into()));
+        Command::new(crate::tooling::find_binary("yt-dlp").unwrap_or_else(|| "yt-dlp".into()));
     // IDEs and debugging shells may set this to a path the app cannot write.
     // yt-dlp's Python SSL stack honors it during startup, so do not inherit it.
     command.env_remove("SSLKEYLOGFILE");
@@ -3190,11 +3189,11 @@ fn yt_dlp_command() -> Command {
 }
 
 fn ffmpeg_command() -> Command {
-    Command::new(env::var_os("MINEFIA_FFMPEG").unwrap_or_else(|| "ffmpeg".into()))
+    Command::new(crate::tooling::find_binary("ffmpeg").unwrap_or_else(|| "ffmpeg".into()))
 }
 
 fn ffprobe_command() -> Command {
-    Command::new(env::var_os("MINEFIA_FFPROBE").unwrap_or_else(|| "ffprobe".into()))
+    Command::new(crate::tooling::find_binary("ffprobe").unwrap_or_else(|| "ffprobe".into()))
 }
 
 #[cfg(test)]

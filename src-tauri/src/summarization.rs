@@ -281,6 +281,54 @@ pub async fn append_notes(
     request_text(app, api_key, model, instruction, &input, "notes").await
 }
 
+/// Creates the final, detailed notes from the completed transcript. During
+/// recording we keep lightweight incremental notes; this pass replaces them
+/// only after the full-transcript request succeeds.
+pub async fn generate_final_notes(
+    app: &tauri::AppHandle,
+    api_key: &str,
+    transcript: &str,
+    model: &str,
+    note_style: &str,
+) -> Result<String, SummaryError> {
+    if transcript.trim().is_empty() {
+        return Err(SummaryError::Empty);
+    }
+    validate_model(model)?;
+    let instruction = match note_style {
+        "study" => CORNELL_NOTES_INSTRUCTIONS,
+        "meeting" => MEETING_MINUTES_INSTRUCTIONS,
+        _ => return Err(SummaryError::UnsupportedModel),
+    };
+    let pieces = split_text(transcript, MAX_CHARS);
+    if pieces.len() == 1 {
+        return request_text(app, api_key, model, instruction, &pieces[0], "notes").await;
+    }
+
+    // Keep every section represented, then use the selected detailed format to
+    // unify the section drafts without sending an oversized request.
+    let mut section_notes = Vec::with_capacity(pieces.len());
+    for (index, piece) in pieces.iter().enumerate() {
+        let section_instruction = format!(
+            "{instruction}\n\nThis is transcript section {}/{}. Create detailed notes for this section only. Preserve its meaningful information; do not invent context from other sections.",
+            index + 1,
+            pieces.len()
+        );
+        section_notes
+            .push(request_text(app, api_key, model, &section_instruction, piece, "notes").await?);
+    }
+    let combined = section_notes.join("\n\n---\n\n");
+    request_text(
+        app,
+        api_key,
+        model,
+        instruction,
+        &format!("Organize and consolidate these detailed notes from consecutive transcript sections. Preserve all distinct information and do not omit details merely to shorten them.\n\n{combined}"),
+        "notes",
+    )
+    .await
+}
+
 /// Builds a final Markdown summary from the entire transcript. Large transcripts
 /// are folded incrementally so the full recording is covered without one huge request.
 pub async fn summarize_transcript(
