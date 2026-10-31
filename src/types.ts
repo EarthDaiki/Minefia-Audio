@@ -97,6 +97,7 @@ export type OnlineMediaInfo = {
   filenameTitle?: string | null;
   description?: string | null;
   sourceKind: string;
+  sourceLabel?: string | null;
   formatId: string;
   formatLabel: string;
   mediaUrl?: string | null;
@@ -122,6 +123,7 @@ export type OnlineCaption = {
 export type OnlineMediaFormat = {
   formatId: string;
   formatLabel: string;
+  sourceLabel?: string | null;
   mediaUrl?: string | null;
   audioOnly: boolean;
   hasVideo: boolean;
@@ -146,6 +148,7 @@ export type PageMediaInfo = {
   pageUrl: string;
   pageTitle: string;
   media: PageMediaCandidate[];
+  networkMedia: PageMediaCandidate[];
   masterPlaylists: string[];
 };
 

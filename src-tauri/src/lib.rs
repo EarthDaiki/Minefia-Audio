@@ -20,7 +20,7 @@ mod usage;
 
 use audio::AudioInfo;
 use serde::Deserialize;
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 use tauri::Manager;
 
 #[derive(Debug, Deserialize)]
@@ -73,12 +73,14 @@ fn append_technical_log(
 #[tauri::command]
 async fn inspect_online_media(
     app: tauri::AppHandle,
+    manager: tauri::State<'_, online_media::OnlineMediaManager>,
     url: String,
     headless_mode: bool,
 ) -> Result<online_media::OnlineMediaInfo, errors::AppError> {
-    online_media::inspect(&app, &url, headless_mode)
-        .await
-        .map_err(errors::classify)
+    let cancel = manager.begin().map_err(errors::classify)?;
+    let result = online_media::inspect(&app, &url, headless_mode, &cancel).await;
+    manager.finish(&cancel);
+    result.map_err(errors::classify)
 }
 
 #[tauri::command]
@@ -95,6 +97,7 @@ async fn download_online_caption(
 #[tauri::command]
 async fn inspect_web_page(
     app: tauri::AppHandle,
+    manager: tauri::State<'_, online_media::OnlineMediaManager>,
     url: String,
     headless_mode: bool,
 ) -> Result<browser_media::PageMediaInfo, errors::AppError> {
@@ -102,14 +105,28 @@ async fn inspect_web_page(
         .path()
         .app_data_dir()
         .map_err(|error| errors::classify(error.to_string()))?;
+    let cancel = manager.begin().map_err(errors::classify)?;
     let profile_dir = data_dir.join("browser-profile");
     let chromium_dir = data_dir.join("browser-runtime");
-    tokio::task::spawn_blocking(move || {
-        browser_media::inspect(url, profile_dir, chromium_dir, headless_mode)
+    let task_cancel = Arc::clone(&cancel);
+    let result = match tokio::task::spawn_blocking(move || {
+        browser_media::inspect(
+            url,
+            profile_dir,
+            chromium_dir,
+            headless_mode,
+            task_cancel.as_ref(),
+        )
     })
     .await
-    .map_err(|error| errors::classify(format!("Browser inspection failed: {error}")))?
-    .map_err(errors::classify)
+    {
+        Ok(result) => result.map_err(errors::classify),
+        Err(error) => Err(errors::classify(format!(
+            "Browser inspection failed: {error}"
+        ))),
+    };
+    manager.finish(&cancel);
+    result
 }
 
 #[tauri::command]

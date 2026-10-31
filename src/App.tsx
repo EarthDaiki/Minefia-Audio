@@ -243,6 +243,7 @@ export default function App() {
   const [webPageInfo, setWebPageInfo] = useState<PageMediaInfo | null>(null);
   const [webPageInspecting, setWebPageInspecting] = useState(false);
   const [onlineMedia, setOnlineMedia] = useState<OnlineMediaInfo | null>(null);
+  const [onlineShowAllSources, setOnlineShowAllSources] = useState(false);
   const [selectedOnlineCaptionId, setSelectedOnlineCaptionId] = useState("");
   const [onlineCaptionLoading, setOnlineCaptionLoading] = useState(false);
   const [onlineInspecting, setOnlineInspecting] = useState(false);
@@ -1530,6 +1531,14 @@ export default function App() {
   const selectedTranscriptTranslationModel = availableTranslationModels.find((item) => item.id === transcriptTranslationModel);
   const selectedSummaryTranslationModel = availableTranslationModels.find((item) => item.id === summaryTranslationModel);
   const selectedQuestionModel = availableTranslationModels.find((item) => item.id === questionModel);
+  const onlineFormatSourceLabel = onlineMedia?.availableFormats.find((format) => format.formatId === onlineMedia.formatId)?.sourceLabel ?? onlineMedia?.sourceLabel ?? "";
+  // Keep the backend discovery order so the first HLS playlist shown matches
+  // the first playlist observed on the page.
+  const onlineSourceLabels = onlineMedia ? [...new Set(onlineMedia.availableFormats.map((format) => format.sourceLabel).filter((label): label is string => Boolean(label)))] : [];
+  const onlineHlsSourceLabels = onlineSourceLabels.filter((label) => label.startsWith("HLS playlist "));
+  const visibleOnlineSourceLabels = onlineHlsSourceLabels.length > 0 && !onlineShowAllSources ? [onlineHlsSourceLabels[0]] : onlineSourceLabels;
+  const hiddenOnlineSourceCount = onlineSourceLabels.length - visibleOnlineSourceLabels.length;
+  const selectedOnlineSourceFormats = onlineMedia?.availableFormats.filter((format) => format.sourceLabel === onlineFormatSourceLabel) ?? [];
   const summaryModelLocked = summaryGenerating || notesUpdating || ((systemRecording || liveRecording || systemStopping || liveStopping)
     && (summaryMode || notesMode || transcriptTabs.current.system.summaryMode || transcriptTabs.current.system.notesMode));
   const translationEstimate = estimateTranslationCost(transcriptTranslationModel, transcript);
@@ -1658,7 +1667,7 @@ export default function App() {
     if (message.includes("PROTECTED") || message.toLowerCase().includes("protected")) return "This media appears to be protected. Minefia Audio does not bypass DRM or access controls.";
     if (message.includes("REENCODE_APPROVAL_REQUIRED")) return "This audio format needs conversion. Review and approve conversion before continuing.";
     if (message.toLowerCase().includes("forbidden") || message.toLowerCase().includes("unauthorized")) return "This URL is not accessible. Check its permissions or use a directly accessible media URL.";
-    if (message.toLowerCase().includes("canceled")) return "Online media extraction was canceled.";
+    if (message.toLowerCase().includes("canceled")) return message.toLowerCase().includes("inspect") ? "Online media inspection was canceled." : "Online media extraction was canceled.";
     return message;
   }
 
@@ -1679,6 +1688,8 @@ export default function App() {
     const url = (urlOverride ?? onlineUrl).trim();
     if (!url || onlineInspecting || webPageInspecting || onlineExtracting || transcriptionBusyBySlot.online) return;
     if (urlOverride) setOnlineUrl(url);
+    setOnlineCancelRequested(false);
+    setOnlineShowAllSources(false);
     startTechnicalTask(classifyOnlineUrl(url) === "web" ? "Web page inspection" : "Online media inspection");
     setError("");
     setProgress(0);
@@ -1748,7 +1759,7 @@ export default function App() {
           setPhase("Media inspected · audio stream confirmed");
         } catch (mediaCause) {
           // Unknown URLs may be watch pages or signed direct media URLs; try the private browser only as a fallback.
-          if (kind !== "unknown") throw mediaCause;
+          if (kind !== "unknown" || errorMessage(mediaCause).toLowerCase().includes("canceled")) throw mediaCause;
           setOnlineInspecting(false);
           setWebPageInspecting(true);
           setPhase("Checking the page for media that is currently loaded");
@@ -1763,6 +1774,11 @@ export default function App() {
     } catch (cause) {
       const message = errorMessage(cause);
       recordTechnicalLog("Online media", `Inspection failed: ${message}`, "online");
+      if (message.toLowerCase().includes("canceled")) {
+        setError("Online media inspection was canceled.");
+        setPhase("Inspection canceled");
+        return;
+      }
       setError(message.includes("MASTER_PLAYLIST_NOT_FOUND")
         ? "A blob video was found, but no master.m3u8 playlist appeared in the observed network traffic."
         : message.includes("WEB_MEDIA_NOT_FOUND")
@@ -1772,6 +1788,7 @@ export default function App() {
     } finally {
       setOnlineInspecting(false);
       setWebPageInspecting(false);
+      setOnlineCancelRequested(false);
     }
   }
 
@@ -1779,6 +1796,15 @@ export default function App() {
     setOnlineMedia((current) => {
       if (!current) return current;
       const choice = current.availableFormats.find((format) => format.formatId === formatId);
+      return choice ? { ...current, ...choice } : current;
+    });
+  }
+
+  function selectOnlineSource(sourceLabel: string) {
+    setOnlineMedia((current) => {
+      if (!current) return current;
+      const candidates = current.availableFormats.filter((format) => format.sourceLabel === sourceLabel);
+      const choice = candidates.find((format) => format.recommended) ?? candidates[0];
       return choice ? { ...current, ...choice } : current;
     });
   }
@@ -1917,9 +1943,9 @@ export default function App() {
   }
 
   async function cancelOnlineExtraction() {
-    if (!onlineExtracting || onlineCancelRequested) return;
+    if (!(onlineExtracting || onlineInspecting || webPageInspecting) || onlineCancelRequested) return;
     setOnlineCancelRequested(true);
-    setPhase("Canceling and cleaning up temporary media");
+    setPhase(onlineExtracting ? "Canceling and cleaning up temporary media" : "Canceling media inspection");
     try { await invoke("cancel_online_media"); }
     catch (cause) {
       const message = onlineErrorMessage(cause);
@@ -2475,8 +2501,12 @@ export default function App() {
                     {onlineCaptionLoading ? "Loading caption…" : "Use selected caption as transcript"}
                   </button>
                 </div>}
-                {(onlineMedia.availableFormats.length > 1 || onlineMedia.sourceKind.toLowerCase().includes("hls")) && <label className="online-quality-select"><span>{onlineMedia.sourceKind.toLowerCase().includes("hls") ? "HLS audio stream" : "Audio quality"}</span><select value={onlineMedia.formatId} onChange={(event) => selectOnlineFormat(event.target.value)} disabled={onlineExtracting || transcriptionBusyBySlot.online}>{onlineMedia.availableFormats.map((format) => <option value={format.formatId} key={format.formatId}>{format.recommended ? `Best audio quality (recommended) · ${format.formatLabel}` : format.formatLabel}</option>)}</select><small>Choose the playlist stream to download. Best audio quality prefers the highest available bitrate and sample rate. Audio-only streams avoid downloading video.</small></label>}
-                <div className="online-format"><small>SELECTED FORMAT</small><strong>{onlineMedia.formatLabel}</strong><span>{onlineMedia.audioOnly ? "Audio-only stream · no video download" : "Audio and video stream · video will be temporary"}</span></div>
+                {onlineMedia.sourceKind.toLowerCase().includes("web page") && onlineSourceLabels.length > 0 ? <div className="online-source-selectors">
+                  <label className="online-quality-select online-source-choice"><span>Detected media source</span><select value={onlineFormatSourceLabel} onChange={(event) => selectOnlineSource(event.target.value)} disabled={onlineExtracting || transcriptionBusyBySlot.online}>{visibleOnlineSourceLabels.map((label) => <option value={label} key={label}>{label}</option>)}</select><small>{onlineHlsSourceLabels.length > 0 && !onlineShowAllSources ? "The first detected HLS playlist is selected. Other playlists and direct video/audio responses are hidden." : "Choose a detected HLS playlist or a direct video/audio response."}</small></label>
+                  {onlineFormatSourceLabel.startsWith("HLS playlist ") && selectedOnlineSourceFormats.length > 1 && <label className="online-quality-select online-hls-quality"><span>Audio quality in this playlist</span><select value={onlineMedia.formatId} onChange={(event) => selectOnlineFormat(event.target.value)} disabled={onlineExtracting || transcriptionBusyBySlot.online}>{selectedOnlineSourceFormats.map((format) => <option value={format.formatId} key={format.formatId}>{format.recommended ? `Best available · ${format.formatLabel}` : format.formatLabel}</option>)}</select><small>Quality variants are shown only after selecting this HLS playlist.</small></label>}
+                  {hiddenOnlineSourceCount > 0 && <button type="button" className="online-load-more" onClick={() => setOnlineShowAllSources(true)}>Load more sources <span>{hiddenOnlineSourceCount}</span></button>}
+                </div> : (onlineMedia.availableFormats.length > 1 || onlineMedia.sourceKind.toLowerCase().includes("hls")) && <label className="online-quality-select"><span>{onlineMedia.sourceKind.toLowerCase().includes("hls") ? "HLS audio stream" : "Audio quality"}</span><select value={onlineMedia.formatId} onChange={(event) => selectOnlineFormat(event.target.value)} disabled={onlineExtracting || transcriptionBusyBySlot.online}>{onlineMedia.availableFormats.map((format) => <option value={format.formatId} key={format.formatId}>{format.recommended ? `Best audio quality (recommended) · ${format.formatLabel}` : format.formatLabel}</option>)}</select><small>Choose the playlist stream to download. Best audio quality prefers the highest available bitrate and sample rate. Audio-only streams avoid downloading video.</small></label>}
+                <div className="online-format"><small>SELECTED FORMAT</small>{onlineFormatSourceLabel && <span className="online-selected-source">{onlineFormatSourceLabel}</span>}<strong>{onlineMedia.formatLabel}</strong><span>{onlineMedia.audioOnly ? "Audio-only stream · no video download" : "Audio and video stream · video will be temporary"}</span></div>
                 <p className="online-quality-note">The selected stream is saved in its original audio format without re-encoding.</p>
                 {onlineMedia.hasVideo && <label className="keep-video-option"><input type="checkbox" checked={onlineKeepVideo} onChange={(event) => setOnlineKeepVideo(event.target.checked)} disabled={onlineExtracting || transcriptionBusyBySlot.online} /><span><strong>Keep downloaded video in app storage</strong><small>Off by default. The temporary video is removed after audio extraction.</small></span></label>}
                 <button className="primary-button transcribe-button" onClick={() => void extractOnlineAudio()} disabled={onlineExtracting || transcriptionBusyBySlot.online}>{onlineExtracting ? <Loader2 className="spin" size={18} /> : <AudioLines size={18} />}{onlineCancelRequested ? "Canceling…" : onlineExtracting ? "Extracting audio…" : "Extract audio"}{!onlineExtracting && <ArrowRight size={18} />}</button>
@@ -2485,8 +2515,9 @@ export default function App() {
               {webPageInfo && <div className="page-media-card card">
                 <div className="section-label"><AudioLines size={15} /><span>Loaded sources · {webPageInfo.pageTitle}</span></div>
                 {webPageInfo.media.map((item, index) => <div className="page-media-item" key={`${item.url}-${index}`}><div><strong>{item.label}</strong><small>{item.contentType || `${item.kind === "audio" ? "Audio" : "Video"} source`}{item.durationSeconds ? ` · ${formatDuration(item.durationSeconds)}` : ""}</small><code>{item.url}</code></div><button onClick={() => inspectPageSource(item.url)} disabled={onlineInspecting || onlineExtracting || transcriptionBusyBySlot.online}>Inspect source</button></div>)}
+                {webPageInfo.networkMedia.map((item, index) => <div className="page-media-item" key={`${item.url}-${index}`}><div><strong>{item.label}</strong><small>Found in network response · {item.contentType || `${item.kind} media`}</small><code>{item.url}</code></div><button onClick={() => inspectPageSource(item.url)} disabled={onlineInspecting || onlineExtracting || transcriptionBusyBySlot.online}>Inspect response</button></div>)}
                 {webPageInfo.masterPlaylists.map((url) => <div className="page-media-item" key={url}><div><strong>HLS master playlist</strong><small>Discovered from the browser network response</small><code>{url}</code></div><button onClick={() => inspectPageSource(url)} disabled={onlineInspecting || onlineExtracting || transcriptionBusyBySlot.online}>Inspect HLS</button></div>)}
-                {webPageInfo.media.length === 0 && webPageInfo.masterPlaylists.length === 0 && <p className="validation-note">No currently loaded source was found.</p>}
+                {webPageInfo.media.length === 0 && webPageInfo.networkMedia.length === 0 && webPageInfo.masterPlaylists.length === 0 && <p className="validation-note">No currently loaded source was found.</p>}
               </div>}
               {audio && audioOwner === "online" && <div className="file-card card">
                 <div className="file-card-top"><div className="file-icon"><FileAudio size={24} /></div><div className="file-title"><strong>{audio.name}</strong><span>AUDIO · {formatBytes(audio.sizeBytes)} · {formatDuration(audio.durationSeconds)} · saved in app storage</span></div></div>
@@ -2495,7 +2526,7 @@ export default function App() {
               <div className="online-input-card card">
                 <div className="section-label"><Globe size={15} /><span>Paste a URL</span></div>
                 <p>Paste a YouTube link, HLS playlist, direct media URL, or webpage. Minefia detects the source type and checks for audio automatically. Only public or otherwise authorized sources are supported.</p>
-                <div className="online-url-row"><input type="url" value={onlineUrl} onChange={(event) => setOnlineUrl(event.target.value)} placeholder="https://…" disabled={onlineInspecting || webPageInspecting || onlineExtracting || transcriptionBusyBySlot.online} onKeyDown={(event) => { if (event.key === "Enter") void inspectOnline(); }} /><button onClick={() => void inspectOnline()} disabled={!onlineUrl.trim() || onlineInspecting || webPageInspecting || onlineExtracting || transcriptionBusyBySlot.online}>{onlineInspecting || webPageInspecting ? <Loader2 className="spin" size={15} /> : <AudioLines size={15} />}{onlineInspecting || webPageInspecting ? "Checking…" : "Inspect"}</button></div>
+                <div className="online-url-row"><input type="url" value={onlineUrl} onChange={(event) => setOnlineUrl(event.target.value)} placeholder="https://…" disabled={onlineInspecting || webPageInspecting || onlineExtracting || transcriptionBusyBySlot.online} onKeyDown={(event) => { if (event.key === "Enter") void inspectOnline(); }} /><button onClick={() => void inspectOnline()} disabled={!onlineUrl.trim() || onlineInspecting || webPageInspecting || onlineExtracting || transcriptionBusyBySlot.online}>{onlineInspecting || webPageInspecting ? <Loader2 className="spin" size={15} /> : <AudioLines size={15} />}{onlineInspecting || webPageInspecting ? "Checking…" : "Inspect"}</button>{(onlineInspecting || webPageInspecting) && <button className="online-cancel-button" onClick={() => void cancelOnlineExtraction()} disabled={onlineCancelRequested}>{onlineCancelRequested ? "Cancel requested" : "Cancel inspection"}</button>}</div>
                 <small className="online-privacy-note">HLS playlists and direct media are inspected directly. For webpages, Minefia checks loaded media and network requests in its private browser. DRM, login walls, and access controls are not bypassed.</small>
               </div>
 

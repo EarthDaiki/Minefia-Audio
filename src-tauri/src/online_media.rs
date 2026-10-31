@@ -4,7 +4,7 @@ use futures_util::{stream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -28,6 +28,9 @@ type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 const MIN_AUDIO_BITRATE_KBPS: f64 = 64.0;
 const MIN_SAMPLE_RATE_HZ: u32 = 24_000;
 const MAX_HLS_CHILDREN: usize = 12;
+const MAX_PAGE_HTML_MEDIA: usize = 4;
+const MAX_PAGE_NETWORK_MEDIA: usize = 8;
+const MAX_PAGE_DIRECT_MEDIA: usize = MAX_PAGE_HTML_MEDIA + MAX_PAGE_NETWORK_MEDIA;
 const MAX_PARALLEL_DOWNLOADS: usize = 20;
 const MAX_PARALLEL_PER_HOST: usize = 10;
 
@@ -116,6 +119,7 @@ pub struct OnlineMediaInfo {
     pub filename_title: Option<String>,
     pub description: Option<String>,
     pub source_kind: String,
+    pub source_label: Option<String>,
     pub format_id: String,
     pub format_label: String,
     pub media_url: Option<String>,
@@ -144,6 +148,7 @@ pub struct OnlineCaption {
 pub struct OnlineMediaFormat {
     pub format_id: String,
     pub format_label: String,
+    pub source_label: Option<String>,
     pub media_url: Option<String>,
     pub audio_only: bool,
     pub has_video: bool,
@@ -227,6 +232,7 @@ struct HlsResource {
 #[derive(Clone)]
 struct Candidate {
     id: String,
+    source_label: Option<String>,
     url: Option<String>,
     http_headers: HashMap<String, String>,
     audio_only: bool,
@@ -265,8 +271,9 @@ pub async fn inspect(
     app: &tauri::AppHandle,
     url: &str,
     headless_mode: bool,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<OnlineMediaInfo, OnlineMediaError> {
-    validate_url(url).await?;
+    cancellable(validate_url(url), Some(cancel)).await??;
     let cache_root = app
         .path()
         .app_cache_dir()
@@ -275,7 +282,7 @@ pub async fn inspect(
     tokio::fs::create_dir_all(&cache_root).await?;
 
     let mut yt_dlp_failure = None;
-    match yt_dlp_metadata(url, None).await {
+    match yt_dlp_metadata(url, Some(cancel)).await {
         Ok(Some(value)) => {
             let candidates = ytdlp_candidates(&value);
             if let Some(candidate) = choose_candidate(candidates.clone()) {
@@ -310,8 +317,8 @@ pub async fn inspect(
     }
 
     if looks_like_hls(url) {
-        validate_hls_children(url).await?;
-        let (title, candidates) = inspect_hls(url).await?;
+        validate_hls_children(url, cancel).await?;
+        let (title, candidates) = inspect_hls(url, cancel).await?;
         let candidate = choose_candidate(candidates.clone()).ok_or(OnlineMediaError::NoAudio)?;
         let media_url = candidate.url.clone();
         return Ok(to_info(
@@ -328,44 +335,94 @@ pub async fn inspect(
 
     // If yt-dlp cannot inspect a page, observe its loaded media requests and
     // then inspect the discovered master playlist rather than guessing URLs.
-    if let Ok(found) = inspect_page_network(app, url, headless_mode).await {
-        if let Some(master) = found.master_playlists.first() {
-            validate_url(master).await?;
-            let (title, candidates) = inspect_hls(master).await?;
-            let candidate =
-                choose_candidate(candidates.clone()).ok_or(OnlineMediaError::NoAudio)?;
+    if cancel.load(Ordering::Acquire) {
+        return Err(OnlineMediaError::Canceled);
+    }
+    if let Ok(found) = inspect_page_network(app, url, headless_mode, cancel).await {
+        let mut page_candidates = Vec::new();
+        let mut seen_media_urls = BTreeSet::new();
+        let direct_media_limit = if found.master_playlists.is_empty() {
+            MAX_PAGE_DIRECT_MEDIA
+        } else {
+            MAX_PAGE_HTML_MEDIA
+        };
+        for media in found
+            .media
+            .iter()
+            .take(MAX_PAGE_HTML_MEDIA)
+            .chain(found.network_media.iter().take(MAX_PAGE_NETWORK_MEDIA))
+        {
+            if cancel.load(Ordering::Acquire) {
+                return Err(OnlineMediaError::Canceled);
+            }
+            if !seen_media_urls.insert(media.url.clone()) {
+                continue;
+            }
+            if page_candidates.len() >= direct_media_limit {
+                break;
+            }
+            if let Ok(mut candidate) = probe_candidate(
+                &media.url,
+                &format!("page-media-{}", page_candidates.len()),
+                Some(media.url.clone()),
+                None,
+                cancel,
+            )
+            .await
+            {
+                candidate.source_label = Some(media.label.clone());
+                page_candidates.push(candidate);
+            }
+        }
+        let mut first_hls_candidate = None;
+        for (index, master) in found.master_playlists.iter().enumerate() {
+            if cancel.load(Ordering::Acquire) {
+                return Err(OnlineMediaError::Canceled);
+            }
+            let remaining_capacity = MAX_HLS_CHILDREN.saturating_sub(page_candidates.len());
+            if remaining_capacity == 0 {
+                break;
+            }
+            if let Ok((_, mut candidates)) = inspect_hls(master, cancel).await {
+                candidates.truncate(remaining_capacity);
+                for candidate in &mut candidates {
+                    candidate.id = format!("page-hls-{index}-{}", candidate.id);
+                    candidate.source_label = Some(format!(
+                        "HLS playlist {:02} · {}",
+                        index + 1,
+                        safe_source_name(master)
+                    ));
+                }
+                if first_hls_candidate.is_none() {
+                    first_hls_candidate = choose_candidate(candidates.clone());
+                }
+                page_candidates.extend(candidates);
+            }
+        }
+        if cancel.load(Ordering::Acquire) {
+            return Err(OnlineMediaError::Canceled);
+        }
+        if let Some(candidate) =
+            first_hls_candidate.or_else(|| choose_candidate(page_candidates.clone()))
+        {
             let media_url = candidate.url.clone();
             return Ok(to_info(
                 url,
-                title.unwrap_or(found.page_title),
+                found.page_title,
                 None,
-                "HLS",
+                "Web page",
                 candidate,
                 media_url,
-                candidates,
+                page_candidates,
                 Vec::new(),
             ));
         }
-        if let Some(media) = found.media.first() {
-            validate_url(&media.url).await?;
-            if let Ok(candidate) =
-                probe_candidate(&media.url, "page-media", Some(media.url.clone()), None).await
-            {
-                return Ok(to_info(
-                    url,
-                    found.page_title,
-                    None,
-                    source_kind(url),
-                    candidate.clone(),
-                    candidate.url.clone(),
-                    vec![candidate],
-                    Vec::new(),
-                ));
-            }
+        if cancel.load(Ordering::Acquire) {
+            return Err(OnlineMediaError::Canceled);
         }
     }
 
-    let public_url = match resolve_public_redirects(url).await {
+    let public_url = match resolve_public_redirects(url, cancel).await {
         Ok(url) => url,
         Err(error) if is_youtube_url(url) => {
             return Err(youtube_extraction_error(
@@ -375,17 +432,24 @@ pub async fn inspect(
         }
         Err(error) => return Err(error),
     };
-    let candidate =
-        match probe_candidate(&public_url, "direct", Some(public_url.clone()), None).await {
-            Ok(candidate) => candidate,
-            Err(error) if is_youtube_url(url) => {
-                return Err(youtube_extraction_error(
-                    yt_dlp_failure.as_deref(),
-                    &error.to_string(),
-                ))
-            }
-            Err(error) => return Err(error),
-        };
+    let candidate = match probe_candidate(
+        &public_url,
+        "direct",
+        Some(public_url.clone()),
+        None,
+        cancel,
+    )
+    .await
+    {
+        Ok(candidate) => candidate,
+        Err(error) if is_youtube_url(url) => {
+            return Err(youtube_extraction_error(
+                yt_dlp_failure.as_deref(),
+                &error.to_string(),
+            ))
+        }
+        Err(error) => return Err(error),
+    };
     if !candidate.has_video && !candidate.audio_only {
         return Err(OnlineMediaError::NoAudio);
     }
@@ -405,6 +469,7 @@ async fn inspect_page_network(
     app: &tauri::AppHandle,
     url: &str,
     headless_mode: bool,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<crate::browser_media::PageMediaInfo, OnlineMediaError> {
     let data_dir = app
         .path()
@@ -413,12 +478,25 @@ async fn inspect_page_network(
     let profile_dir = data_dir.join("browser-profile");
     let chromium_dir = data_dir.join("browser-runtime");
     let url = url.to_owned();
+    let task_cancel = Arc::clone(cancel);
     tokio::task::spawn_blocking(move || {
-        crate::browser_media::inspect(url, profile_dir, chromium_dir, headless_mode)
+        crate::browser_media::inspect(
+            url,
+            profile_dir,
+            chromium_dir,
+            headless_mode,
+            task_cancel.as_ref(),
+        )
     })
     .await
     .map_err(|error| OnlineMediaError::Inspect(error.to_string()))?
-    .map_err(OnlineMediaError::Inspect)
+    .map_err(|message| {
+        if cancel.load(Ordering::Acquire) || message == "CANCELED" {
+            OnlineMediaError::Canceled
+        } else {
+            OnlineMediaError::Inspect(message)
+        }
+    })
 }
 
 async fn inspect_browser_session(
@@ -717,6 +795,14 @@ fn youtube_transcription_context(media: &OnlineMediaInfo) -> String {
     .join("\n")
 }
 
+fn safe_source_name(value: &str) -> String {
+    reqwest::Url::parse(value)
+        .ok()
+        .map(|url| format!("{}{}", url.host_str().unwrap_or("media"), url.path()))
+        .map(|name| name.chars().take(100).collect())
+        .unwrap_or_else(|| "media source".into())
+}
+
 async fn yt_dlp_metadata(
     url: &str,
     cancel: Option<&AtomicBool>,
@@ -843,6 +929,7 @@ fn ytdlp_candidates(value: &Value) -> Vec<Candidate> {
                     .and_then(Value::as_str)
                     .unwrap_or("")
             ),
+            source_label: None,
             url: format
                 .get("url")
                 .and_then(Value::as_str)
@@ -1065,8 +1152,11 @@ fn parse_ytdlp_headers(value: Option<&Value>) -> HashMap<String, String> {
         .collect()
 }
 
-async fn inspect_hls(url: &str) -> Result<(Option<String>, Vec<Candidate>), OnlineMediaError> {
-    let body = fetch_manifest(url).await?;
+async fn inspect_hls(
+    url: &str,
+    cancel: &AtomicBool,
+) -> Result<(Option<String>, Vec<Candidate>), OnlineMediaError> {
+    let body = fetch_manifest(url, cancel).await?;
     let base_title = file_title(url);
     if !body.trim_start().starts_with("#EXTM3U") {
         return Err(OnlineMediaError::Inspect(
@@ -1077,18 +1167,23 @@ async fn inspect_hls(url: &str) -> Result<(Option<String>, Vec<Candidate>), Onli
     let mut candidates = Vec::new();
     let mut audio_index = 0usize;
     for line in &lines {
+        if cancel.load(Ordering::Acquire) {
+            return Err(OnlineMediaError::Canceled);
+        }
         if line.starts_with("#EXT-X-MEDIA:") && attr(line, "TYPE").as_deref() == Some("AUDIO") {
             if let Some(uri) = attr(line, "URI") {
                 if audio_index < MAX_HLS_CHILDREN {
-                    let media_url = resolve_public_redirects(&resolve_url(url, &uri)?).await?;
+                    let media_url =
+                        resolve_public_redirects(&resolve_url(url, &uri)?, cancel).await?;
                     if looks_like_hls(&media_url) {
-                        validate_hls_children(&media_url).await?;
+                        validate_hls_children(&media_url, cancel).await?;
                     }
                     if let Ok(candidate) = probe_candidate(
                         &media_url,
                         &format!("hls-audio-{audio_index}"),
                         Some(media_url.clone()),
                         None,
+                        cancel,
                     )
                     .await
                     {
@@ -1106,21 +1201,26 @@ async fn inspect_hls(url: &str) -> Result<(Option<String>, Vec<Candidate>), Onli
         let mut pending_height = None;
         let mut pending_variant = false;
         for line in &lines {
+            if cancel.load(Ordering::Acquire) {
+                return Err(OnlineMediaError::Canceled);
+            }
             if line.starts_with("#EXT-X-STREAM-INF:") {
                 pending_variant = true;
                 pending_height = attr(line, "RESOLUTION")
                     .and_then(|value| value.split('x').last()?.parse().ok());
             } else if !line.is_empty() && !line.starts_with('#') && pending_variant {
                 if variant_index < MAX_HLS_CHILDREN {
-                    let media_url = resolve_public_redirects(&resolve_url(url, line)?).await?;
+                    let media_url =
+                        resolve_public_redirects(&resolve_url(url, line)?, cancel).await?;
                     if looks_like_hls(&media_url) {
-                        validate_hls_children(&media_url).await?;
+                        validate_hls_children(&media_url, cancel).await?;
                     }
                     if let Ok(candidate) = probe_candidate(
                         &media_url,
                         &format!("hls-variant-{variant_index}"),
                         Some(media_url.clone()),
                         pending_height,
+                        cancel,
                     )
                     .await
                     {
@@ -1136,7 +1236,8 @@ async fn inspect_hls(url: &str) -> Result<(Option<String>, Vec<Candidate>), Onli
         }
     }
     if candidates.is_empty() {
-        let candidate = probe_candidate(url, "hls-index", Some(url.to_owned()), None).await?;
+        let candidate =
+            probe_candidate(url, "hls-index", Some(url.to_owned()), None, cancel).await?;
         if !candidate.audio_only && !candidate.has_video {
             return Err(OnlineMediaError::NoAudio);
         }
@@ -1145,13 +1246,13 @@ async fn inspect_hls(url: &str) -> Result<(Option<String>, Vec<Candidate>), Onli
     Ok((Some(base_title), candidates))
 }
 
-async fn fetch_manifest(url: &str) -> Result<String, OnlineMediaError> {
+async fn fetch_manifest(url: &str, cancel: &AtomicBool) -> Result<String, OnlineMediaError> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|error| OnlineMediaError::Inspect(error.to_string()))?;
-    fetch_manifest_with_client(&client, url, None).await
+    fetch_manifest_with_client(&client, url, Some(cancel)).await
 }
 
 async fn fetch_manifest_with_client(
@@ -1226,6 +1327,7 @@ async fn probe_candidate(
     id: &str,
     media_url: Option<String>,
     height: Option<u32>,
+    cancel: &AtomicBool,
 ) -> Result<Candidate, OnlineMediaError> {
     let mut command = ffprobe_command();
     command.args([
@@ -1243,10 +1345,13 @@ async fn probe_candidate(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let output = timeout(Duration::from_secs(30), command.output())
-        .await
-        .map_err(|_| OnlineMediaError::Inspect("Media stream inspection timed out.".into()))?
-        .map_err(|error| OnlineMediaError::Inspect(format!("ffprobe is unavailable: {error}")))?;
+    let output = command_output(
+        command,
+        cancel,
+        Duration::from_secs(30),
+        "Media stream inspection timed out.",
+    )
+    .await?;
     if !output.status.success() {
         return Err(OnlineMediaError::Inspect(
             String::from_utf8_lossy(&output.stderr)
@@ -1294,6 +1399,7 @@ async fn probe_candidate(
     let codec = normalize_codec(audio.codec_name.as_deref().unwrap_or("unknown"));
     Ok(Candidate {
         id: id.to_owned(),
+        source_label: None,
         url: media_url,
         http_headers: HashMap::new(),
         audio_only: !has_video,
@@ -1402,7 +1508,24 @@ fn to_info(
         .map(|language| format!("{} · {}", label, display_language(language)))
         .unwrap_or(label);
     let _ = candidate.extension;
-    let recommended_id = choose_candidate(candidates.clone()).map(|item| item.id);
+    let recommended_ids = if source == "Web page" {
+        let mut groups = HashMap::<String, Vec<Candidate>>::new();
+        for item in &candidates {
+            groups
+                .entry(item.source_label.clone().unwrap_or_default())
+                .or_default()
+                .push(item.clone());
+        }
+        groups
+            .values()
+            .filter_map(|items| choose_candidate(items.clone()))
+            .map(|item| item.id)
+            .collect::<BTreeSet<_>>()
+    } else {
+        choose_candidate(candidates.clone())
+            .map(|item| [item.id].into_iter().collect())
+            .unwrap_or_default()
+    };
     let mut ordered_candidates = candidates;
     ordered_candidates.sort_by(|left, right| {
         left.has_video
@@ -1458,6 +1581,7 @@ fn to_info(
             OnlineMediaFormat {
                 format_id: item.id.clone(),
                 format_label: label,
+                source_label: item.source_label.clone(),
                 media_url: item.url,
                 audio_only: item.audio_only,
                 has_video: item.has_video,
@@ -1467,7 +1591,7 @@ fn to_info(
                 sample_rate_hz: item.sample_rate,
                 video_height: item.height,
                 requires_conversion: audio::codec_requires_conversion(&item.codec),
-                recommended: recommended_id.as_deref() == Some(item.id.as_str()),
+                recommended: recommended_ids.contains(item.id.as_str()),
             }
         })
         .collect();
@@ -1487,6 +1611,7 @@ fn to_info(
         },
         title,
         source_kind: source.to_owned(),
+        source_label: candidate.source_label.clone(),
         format_id: candidate.id,
         format_label: label,
         media_url,
@@ -2908,7 +3033,10 @@ async fn validate_url(url: &str) -> Result<(), OnlineMediaError> {
 
 /// Resolve redirects one hop at a time and apply DNS/IP checks to each target.
 /// The tiny ranged request is discarded and never used as the media download.
-async fn resolve_public_redirects(url: &str) -> Result<String, OnlineMediaError> {
+async fn resolve_public_redirects(
+    url: &str,
+    cancel: &AtomicBool,
+) -> Result<String, OnlineMediaError> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(20))
@@ -2916,13 +3044,16 @@ async fn resolve_public_redirects(url: &str) -> Result<String, OnlineMediaError>
         .map_err(|error| OnlineMediaError::Inspect(error.to_string()))?;
     let mut current = url.to_owned();
     for _ in 0..=5 {
-        validate_url(&current).await?;
-        let response = client
-            .get(&current)
-            .header(reqwest::header::RANGE, "bytes=0-0")
-            .send()
-            .await
-            .map_err(|error| OnlineMediaError::Inspect(error.to_string()))?;
+        cancellable(validate_url(&current), Some(cancel)).await??;
+        let response = cancellable(
+            client
+                .get(&current)
+                .header(reqwest::header::RANGE, "bytes=0-0")
+                .send(),
+            Some(cancel),
+        )
+        .await?
+        .map_err(|error| OnlineMediaError::Inspect(error.to_string()))?;
         if response.status().is_redirection() {
             let location = response
                 .headers()
@@ -2934,7 +3065,7 @@ async fn resolve_public_redirects(url: &str) -> Result<String, OnlineMediaError>
             current = resolve_url(&current, location)?;
             continue;
         }
-        validate_url(response.url().as_str()).await?;
+        cancellable(validate_url(response.url().as_str()), Some(cancel)).await??;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED
             || response.status() == reqwest::StatusCode::FORBIDDEN
         {
@@ -2985,8 +3116,8 @@ pub(crate) fn is_public_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-async fn validate_hls_children(url: &str) -> Result<(), OnlineMediaError> {
-    let body = fetch_manifest(url).await?;
+async fn validate_hls_children(url: &str, cancel: &AtomicBool) -> Result<(), OnlineMediaError> {
+    let body = fetch_manifest(url, cancel).await?;
     if !body.trim_start().starts_with("#EXTM3U") {
         return Err(OnlineMediaError::Inspect(
             "The referenced HLS stream is not a playlist.".into(),
@@ -3005,7 +3136,7 @@ async fn validate_hls_children(url: &str) -> Result<(), OnlineMediaError> {
             Some(line.to_owned())
         };
         if let Some(child) = child {
-            validate_url(&resolve_url(url, &child)?).await?;
+            cancellable(validate_url(&resolve_url(url, &child)?), Some(cancel)).await??;
         }
     }
     Ok(())
