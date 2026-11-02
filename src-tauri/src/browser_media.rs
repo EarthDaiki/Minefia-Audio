@@ -82,7 +82,6 @@ pub fn inspect_with_session(
     page_url: String,
     profile_dir: PathBuf,
     chromium_dir: PathBuf,
-    headless_mode: bool,
     cancel: &AtomicBool,
 ) -> Result<BrowserInspection, String> {
     inspect_impl(
@@ -90,7 +89,7 @@ pub fn inspect_with_session(
         profile_dir,
         chromium_dir,
         true,
-        headless_mode,
+        false,
         Some(cancel),
     )
 }
@@ -135,9 +134,9 @@ fn inspect_impl(
     }
     let (browser, tab) = if headless_mode {
         let redirected_url = tab.get_url();
-        if is_login_url(&redirected_url) {
-            // Headless inspection detects provider sign-in redirects; reopen
-            // the same private profile visibly so the user can authenticate.
+        if is_login_url(&redirected_url) || is_human_verification_page(&tab, &redirected_url) {
+            // Headless inspection detects sign-in or human-verification
+            // redirects; reopen the same private profile visibly for the user.
             drop(tab);
             drop(browser);
             let (visible_browser, visible_tab) = create_browser_tab(
@@ -173,9 +172,14 @@ fn inspect_impl(
     }
     let wait_timed_out = !wait_for_network_idle(
         &network_last_activity,
+        &tab,
         Duration::from_secs(60),
         Duration::from_secs(5),
         cancel,
+        include_session,
+        !initial_scan.media.is_empty(),
+        &playlists,
+        &network_media,
     )?;
     if is_canceled(cancel) {
         return Err("CANCELED".into());
@@ -193,7 +197,7 @@ fn inspect_impl(
         .cloned()
         .collect::<Vec<_>>();
 
-    if scan.media.is_empty() && network_sources.is_empty() && found.is_empty() {
+    if scan.media.is_empty() && network_sources.is_empty() && found.is_empty() && !include_session {
         if scan.has_blob_media {
             let timeout_note = if wait_timed_out {
                 " The 1-minute network-idle wait expired."
@@ -312,23 +316,42 @@ fn create_browser_tab(
             let is_media_content =
                 mime_type.starts_with("audio/") || mime_type.starts_with("video/");
             if is_media_content && !is_hls_url(&url) && params.response.status < 400 {
+                // Some media servers expose byte slices as ordinary successful responses and
+                // encode the requested range in the URL instead of returning HTTP 206.
+                let is_byte_range = (params.response.status == 206
+                    && header_value(&params.response.headers, "content-range")
+                        .is_some_and(|value| value.to_ascii_lowercase().starts_with("bytes ")))
+                    || has_byte_start_and_end(&url);
+                let source_url = if is_byte_range {
+                    canonical_byte_range_url(&url)
+                } else {
+                    url.clone()
+                };
+                let source_key = format!("{source_url}\n{mime_type}");
                 if let Ok(mut sources) = captured_network_media.lock() {
-                    if sources.contains_key(&url) || sources.len() < 40 {
+                    if sources.contains_key(&source_key) || sources.len() < 40 {
                         let kind = if mime_type.starts_with("audio/") {
                             "audio"
                         } else {
                             "video"
                         };
                         sources
-                            .entry(url.clone())
+                            .entry(source_key)
                             .or_insert_with(|| PageMediaCandidate {
-                                url: url.clone(),
+                                // Strip only explicit byte-range query parameters so the
+                                // selected source requests the complete underlying object.
+                                url: source_url.clone(),
                                 kind: kind.to_owned(),
                                 content_type: Some(mime_type.clone()),
                                 duration_seconds: None,
                                 label: format!(
-                                    "Network response · {mime_type} · {}",
-                                    safe_media_path(&url)
+                                    "Network response · {mime_type}{} · {}",
+                                    if is_byte_range {
+                                        " · byte-range parts grouped"
+                                    } else {
+                                        ""
+                                    },
+                                    safe_media_path(&source_url)
                                 ),
                             });
                     }
@@ -416,13 +439,18 @@ fn merge_page_scans(mut first: PageScan, later: PageScan) -> PageScan {
     first
 }
 
-/// Treat the configured quiet response window as Network Idle, with a hard timeout.
-/// The timeout is intentional because media pages may continuously stream.
+/// Wait for Network Idle, but leave interactive sign-in and human-verification
+/// pages open until the user completes them or cancels inspection.
 fn wait_for_network_idle(
     last_activity: &Mutex<Instant>,
+    tab: &headless_chrome::Tab,
     timeout: Duration,
     idle_window: Duration,
     cancel: Option<&AtomicBool>,
+    require_media: bool,
+    initial_media_found: bool,
+    playlists: &Mutex<Vec<String>>,
+    network_media: &Mutex<BTreeMap<String, PageMediaCandidate>>,
 ) -> Result<bool, String> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -434,6 +462,25 @@ fn wait_for_network_idle(
                 .lock()
                 .map_err(|_| "Could not read browser network activity.".to_owned())?,
         );
+        // Keep an interactive sign-in page open even when it is quiet. The user
+        // can finish signing in or cancel inspection from the app.
+        let current_url = tab.get_url();
+        let login_page_open = is_login_url(&current_url);
+        let verification_page_open = is_human_verification_page(tab, &current_url);
+        let media_found = !require_media
+            || initial_media_found
+            || !playlists
+                .lock()
+                .map_err(|_| "Could not read the browser network log.".to_owned())?
+                .is_empty()
+            || !network_media
+                .lock()
+                .map_err(|_| "Could not read browser media responses.".to_owned())?
+                .is_empty();
+        if login_page_open || verification_page_open || !media_found {
+            thread::sleep(Duration::from_millis(50));
+            continue;
+        }
         if quiet_for >= idle_window {
             return Ok(true);
         }
@@ -442,6 +489,38 @@ fn wait_for_network_idle(
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn is_human_verification_page(tab: &headless_chrome::Tab, current_url: &str) -> bool {
+    let url_signals_challenge = Url::parse(current_url).ok().is_some_and(|url| {
+        let value =
+            format!("{}{}", url.path(), url.query().unwrap_or_default()).to_ascii_lowercase();
+        ["captcha", "challenge", "checkpoint", "verify-human"]
+            .iter()
+            .any(|signal| value.contains(signal))
+    });
+    if url_signals_challenge {
+        return true;
+    }
+
+    tab.evaluate(
+        r#"(() => {
+          const challengeElement = document.querySelector(
+            'iframe[src*="captcha" i], iframe[src*="challenge" i], [class*="captcha" i], [id*="captcha" i], [data-sitekey], input[name*="captcha" i]'
+          );
+          if (challengeElement) return true;
+          const text = (document.body?.innerText || '').slice(0, 6000).toLowerCase();
+          return text.includes('verify you are human') ||
+            text.includes('complete the security check') ||
+            text.includes('confirm you are not a robot') ||
+            text.includes('security challenge');
+        })()"#,
+        false,
+    )
+    .ok()
+    .and_then(|result| result.value)
+    .and_then(|value| value.as_bool())
+    .unwrap_or(false)
 }
 
 fn find_google_chrome() -> Option<PathBuf> {
@@ -528,6 +607,17 @@ fn is_canceled(cancel: Option<&AtomicBool>) -> bool {
     cancel.is_some_and(|token| token.load(Ordering::Acquire))
 }
 
+/// Tell yt-dlp which app-owned Chromium profile to read, using the same browser
+/// brand whose executable Minefia Audio launches so OS cookie decryption matches.
+pub fn yt_dlp_cookie_profile_spec(profile_dir: &Path) -> String {
+    let browser = if find_google_chrome().is_some() {
+        "chrome"
+    } else {
+        "chromium"
+    };
+    format!("{browser}:{}", profile_dir.join("Default").display())
+}
+
 fn is_login_url(value: &str) -> bool {
     Url::parse(value).ok().is_some_and(|url| {
         url.host_str().is_some_and(|host| {
@@ -598,6 +688,78 @@ fn safe_media_path(value: &str) -> String {
                 .collect()
         })
         .unwrap_or_else(|| "media file".into())
+}
+
+fn header_value(
+    headers: &headless_chrome::protocol::cdp::Network::Headers,
+    name: &str,
+) -> Option<String> {
+    headers
+        .0
+        .as_ref()?
+        .as_object()?
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))?
+        .1
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn canonical_byte_range_url(value: &str) -> String {
+    let Ok(mut url) = Url::parse(value) else {
+        return value.to_owned();
+    };
+    let range_parameters = [
+        "range",
+        "byte_range",
+        "byterange",
+        "bytes",
+        "start_byte",
+        "end_byte",
+        "byte_start",
+        "byte_end",
+        "bytestart",
+        "byteend",
+        "chunk_start",
+        "chunk_end",
+        "offset",
+        "length",
+        "start",
+        "end",
+    ];
+    let retained = url
+        .query_pairs()
+        .filter(|(key, _)| {
+            !range_parameters
+                .iter()
+                .any(|parameter| key.eq_ignore_ascii_case(parameter))
+        })
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    if retained.len() != url.query_pairs().count() {
+        url.set_query(None);
+        if !retained.is_empty() {
+            url.query_pairs_mut().extend_pairs(retained);
+        }
+    }
+    url.to_string()
+}
+
+fn has_byte_start_and_end(value: &str) -> bool {
+    let Ok(url) = Url::parse(value) else {
+        return false;
+    };
+    let mut has_start = false;
+    let mut has_end = false;
+    for (key, _) in url.query_pairs() {
+        has_start |= key.eq_ignore_ascii_case("bytestart")
+            || key.eq_ignore_ascii_case("byte_start")
+            || key.eq_ignore_ascii_case("start_byte");
+        has_end |= key.eq_ignore_ascii_case("byteend")
+            || key.eq_ignore_ascii_case("byte_end")
+            || key.eq_ignore_ascii_case("end_byte");
+    }
+    has_start && has_end
 }
 
 #[cfg(test)]

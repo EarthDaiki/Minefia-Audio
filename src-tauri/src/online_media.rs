@@ -166,12 +166,6 @@ pub struct OnlineMediaFormat {
 pub struct ExtractRequest {
     pub media: OnlineMediaInfo,
     pub keep_video: bool,
-    #[serde(default = "default_headless_mode")]
-    pub headless_mode: bool,
-}
-
-fn default_headless_mode() -> bool {
-    false
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -185,6 +179,23 @@ struct OnlineDownloadProgress {
     downloaded_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     total_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OnlineTechnicalLog {
+    category: &'static str,
+    message: String,
+}
+
+fn emit_technical_log(app: &tauri::AppHandle, category: &'static str, message: impl Into<String>) {
+    let _ = app.emit(
+        "online-technical-log",
+        OnlineTechnicalLog {
+            category,
+            message: message.into(),
+        },
+    );
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -273,6 +284,11 @@ pub async fn inspect(
     headless_mode: bool,
     cancel: &Arc<AtomicBool>,
 ) -> Result<OnlineMediaInfo, OnlineMediaError> {
+    emit_technical_log(
+        app,
+        "Inspect",
+        "Checking that the source URL is public and reachable.",
+    );
     cancellable(validate_url(url), Some(cancel)).await??;
     let cache_root = app
         .path()
@@ -282,41 +298,129 @@ pub async fn inspect(
     tokio::fs::create_dir_all(&cache_root).await?;
 
     let mut yt_dlp_failure = None;
+    let mut requires_browser_login = false;
+    emit_technical_log(app, "Inspect", "Trying yt-dlp without browser cookies.");
     match yt_dlp_metadata(url, Some(cancel)).await {
         Ok(Some(value)) => {
-            let candidates = ytdlp_candidates(&value);
-            if let Some(candidate) = choose_candidate(candidates.clone()) {
-                let media_url = candidate.url.clone();
-                return Ok(to_info(
-                    url,
-                    title_from_json(&value, url),
-                    value
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|text| !text.is_empty())
-                        .map(|text| text.chars().take(4000).collect()),
-                    source_kind(url),
-                    candidate,
-                    media_url,
-                    candidates,
-                    ytdlp_captions(&value),
-                ));
+            if let Some(info) = ytdlp_info(url, value) {
+                emit_technical_log(
+                    app,
+                    "Inspect",
+                    format!(
+                        "yt-dlp found {} usable audio format(s).",
+                        info.available_formats.len()
+                    ),
+                );
+                return Ok(info);
             }
+            emit_technical_log(
+                app,
+                "Inspect",
+                "yt-dlp returned metadata but no usable audio format.",
+            );
         }
-        Ok(None) => {}
-        Err(OnlineMediaError::Download(message)) => yt_dlp_failure = Some(message),
-        Err(error) if is_missing_tool(&error) => {}
+        Ok(None) => emit_technical_log(
+            app,
+            "Inspect",
+            "yt-dlp is unavailable; trying supported URL inspection.",
+        ),
+        Err(OnlineMediaError::Download(message)) => {
+            emit_technical_log(
+                app,
+                "Inspect",
+                format!("yt-dlp could not inspect this source: {message}"),
+            );
+            yt_dlp_failure = Some(message);
+        }
+        Err(error) if is_missing_tool(&error) => {
+            emit_technical_log(
+                app,
+                "Inspect",
+                "yt-dlp is not installed; trying supported URL inspection.",
+            );
+        }
         Err(error @ OnlineMediaError::ProviderLoginRequired)
         | Err(error @ OnlineMediaError::RestrictedSource)
         | Err(error @ OnlineMediaError::Unauthorized { .. })
-        | Err(error @ OnlineMediaError::Forbidden { .. })
-        | Err(error @ OnlineMediaError::Protected) => return Err(error),
+        | Err(error @ OnlineMediaError::Forbidden { .. }) => {
+            // Public access is attempted first. Only this auth failure path
+            // opens the app's persistent browser profile for sign-in.
+            requires_browser_login = true;
+            emit_technical_log(app, "Authentication", "The provider requires sign-in. Checking the app's saved browser profile with yt-dlp.");
+            yt_dlp_failure = Some(error.to_string());
+        }
+        Err(error @ OnlineMediaError::Protected) => return Err(error),
         Err(_error) if looks_like_hls(url) => {}
         Err(_error) => {}
     }
 
-    if looks_like_hls(url) {
+    let mut browser_session_info = None;
+    if requires_browser_login {
+        let profile_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| OnlineMediaError::Inspect(error.to_string()))?
+            .join("browser-profile");
+
+        // First ask yt-dlp to read cookies already saved in Minefia Audio's profile.
+        match yt_dlp_metadata_from_profile(url, Some(cancel), &profile_dir).await {
+            Ok(Some(value)) => {
+                if let Some(info) = ytdlp_info(url, value) {
+                    emit_technical_log(
+                        app,
+                        "Authentication",
+                        "Saved browser profile cookies worked; yt-dlp found usable formats.",
+                    );
+                    return Ok(info);
+                }
+            }
+            Ok(None) => {}
+            Err(error @ OnlineMediaError::Canceled) => return Err(error),
+            Err(error @ OnlineMediaError::Protected) => return Err(error),
+            Err(_) => {}
+        }
+
+        emit_technical_log(
+            app,
+            "Authentication",
+            "Opening the persistent app browser so you can sign in to the source provider.",
+        );
+        let session = inspect_browser_session(app, url, Arc::clone(cancel)).await?;
+        // After sign-in, retry yt-dlp against the exact same persistent profile.
+        emit_technical_log(
+            app,
+            "Authentication",
+            "Sign-in flow ended; retrying yt-dlp with the app browser profile.",
+        );
+        let authenticated = yt_dlp_metadata_from_profile(url, Some(cancel), &profile_dir).await;
+        match authenticated {
+            Ok(Some(value)) => {
+                if let Some(info) = ytdlp_info(url, value) {
+                    emit_technical_log(
+                        app,
+                        "Authentication",
+                        "yt-dlp found usable formats after sign-in.",
+                    );
+                    return Ok(info);
+                }
+                yt_dlp_failure = Some("yt-dlp found no usable audio format after sign-in.".into());
+            }
+            Ok(None) => {
+                yt_dlp_failure = Some("yt-dlp found no downloadable formats after sign-in.".into());
+            }
+            Err(error @ OnlineMediaError::Canceled) => return Err(error),
+            Err(error @ OnlineMediaError::Protected) => return Err(error),
+            Err(error) => yt_dlp_failure = Some(error.to_string()),
+        }
+        browser_session_info = Some(session.info);
+    }
+
+    if looks_like_hls(url) && !requires_browser_login {
+        emit_technical_log(
+            app,
+            "Inspect",
+            "Reading the HLS playlist and checking its audio variants.",
+        );
         validate_hls_children(url, cancel).await?;
         let (title, candidates) = inspect_hls(url, cancel).await?;
         let candidate = choose_candidate(candidates.clone()).ok_or(OnlineMediaError::NoAudio)?;
@@ -338,7 +442,23 @@ pub async fn inspect(
     if cancel.load(Ordering::Acquire) {
         return Err(OnlineMediaError::Canceled);
     }
-    if let Ok(found) = inspect_page_network(app, url, headless_mode, cancel).await {
+    let browser_inspection = match browser_session_info {
+        Some(found) => Some(found),
+        None => {
+            emit_technical_log(app, "Browser", "Opening the page; scanning its HTML media elements and observed network responses.");
+            let result = inspect_page_network(app, url, headless_mode, cancel).await;
+            match &result {
+                Ok(info) => emit_technical_log(
+                    app,
+                    "Browser",
+                    format!("Page scan found {} HTML media source(s), {} network media source(s), and {} HLS playlist(s).", info.media.len(), info.network_media.len(), info.master_playlists.len()),
+                ),
+                Err(error) => emit_technical_log(app, "Browser", format!("Page scan failed: {error}")),
+            }
+            result.ok()
+        }
+    };
+    if let Some(found) = browser_inspection {
         let mut page_candidates = Vec::new();
         let mut seen_media_urls = BTreeSet::new();
         let direct_media_limit = if found.master_playlists.is_empty() {
@@ -374,6 +494,14 @@ pub async fn inspect(
                 page_candidates.push(candidate);
             }
         }
+        emit_technical_log(
+            app,
+            "Inspect",
+            format!(
+                "Checked {} distinct direct media source(s).",
+                page_candidates.len()
+            ),
+        );
         let mut first_hls_candidate = None;
         for (index, master) in found.master_playlists.iter().enumerate() {
             if cancel.load(Ordering::Acquire) {
@@ -383,6 +511,15 @@ pub async fn inspect(
             if remaining_capacity == 0 {
                 break;
             }
+            emit_technical_log(
+                app,
+                "Inspect",
+                format!(
+                    "Reading discovered HLS playlist {} of {} and checking its audio variants.",
+                    index + 1,
+                    found.master_playlists.len()
+                ),
+            );
             if let Ok((_, mut candidates)) = inspect_hls(master, cancel).await {
                 candidates.truncate(remaining_capacity);
                 for candidate in &mut candidates {
@@ -405,6 +542,14 @@ pub async fn inspect(
         if let Some(candidate) =
             first_hls_candidate.or_else(|| choose_candidate(page_candidates.clone()))
         {
+            emit_technical_log(
+                app,
+                "Inspect",
+                format!(
+                    "Inspection complete: {} selectable audio format(s) found.",
+                    page_candidates.len()
+                ),
+            );
             let media_url = candidate.url.clone();
             return Ok(to_info(
                 url,
@@ -432,6 +577,11 @@ pub async fn inspect(
         }
         Err(error) => return Err(error),
     };
+    emit_technical_log(
+        app,
+        "Inspect",
+        "Checking the direct media response and reading its audio metadata.",
+    );
     let candidate = match probe_candidate(
         &public_url,
         "direct",
@@ -453,6 +603,11 @@ pub async fn inspect(
     if !candidate.has_video && !candidate.audio_only {
         return Err(OnlineMediaError::NoAudio);
     }
+    emit_technical_log(
+        app,
+        "Inspect",
+        "Inspection complete: one direct media format is ready.",
+    );
     Ok(to_info(
         url,
         file_title(url),
@@ -502,7 +657,6 @@ async fn inspect_page_network(
 async fn inspect_browser_session(
     app: &tauri::AppHandle,
     url: &str,
-    headless_mode: bool,
     cancel: Arc<AtomicBool>,
 ) -> Result<crate::browser_media::BrowserInspection, OnlineMediaError> {
     let data_dir = app
@@ -518,7 +672,6 @@ async fn inspect_browser_session(
             url,
             profile_dir,
             chromium_dir,
-            headless_mode,
             task_cancel.as_ref(),
         )
     })
@@ -552,6 +705,11 @@ pub async fn extract(
     if cancel.load(Ordering::Acquire) {
         return Err(OnlineMediaError::Canceled);
     }
+    emit_technical_log(
+        app,
+        "Download",
+        "Validating the selected media source and its public redirects.",
+    );
     validate_url(&request.media.url).await?;
     let recordings = crate::storage::dated_download_dir(app).map_err(OnlineMediaError::Download)?;
     let cache = app
@@ -569,6 +727,11 @@ pub async fn extract(
     // obtained when the user inspected the page.
     let mut youtube_candidate =
         if is_youtube_url(&request.media.url) && request.media.format_id.starts_with("yt:") {
+            emit_technical_log(
+                app,
+                "Download",
+                "Refreshing the selected YouTube format because its stream URL may expire.",
+            );
             Some(
                 refresh_youtube_candidate(
                     &request.media.url,
@@ -592,7 +755,17 @@ pub async fn extract(
     validate_url(&media_url).await?;
     let job_identity = format!("{}\n{}", request.media.url, request.media.format_id);
     let job_dir = find_or_create_download_job(&download_root, &job_identity).await?;
+    emit_technical_log(
+        app,
+        "Download",
+        "Download job is ready; checking resumable parts before transfer.",
+    );
     emit_download_progress(&app, "preparing", 0, 0, "Preparing the download");
+    emit_technical_log(
+        app,
+        "Download",
+        "Requesting the selected source using parallel HTTP transfers where possible.",
+    );
     let input = match download_media_parallel(
         &app,
         &media_url,
@@ -605,6 +778,7 @@ pub async fn extract(
     .await
     {
         Err(error) if is_http_access_error(&error) => {
+            emit_technical_log(app, "Authentication", "The media server denied the direct request; opening the app browser session and retrying with its source session.");
             emit_download_progress(
                 &app,
                 "checking",
@@ -612,13 +786,8 @@ pub async fn extract(
                 0,
                 "Opening the source in the app browser to check its signed-in session",
             );
-            let session = inspect_browser_session(
-                &app,
-                &request.media.url,
-                request.headless_mode,
-                Arc::clone(cancel),
-            )
-            .await?;
+            let session =
+                inspect_browser_session(&app, &request.media.url, Arc::clone(cancel)).await?;
             let browser_url = session
                 .info
                 .master_playlists
@@ -704,6 +873,11 @@ pub async fn extract(
         }
         result => result?,
     };
+    emit_technical_log(
+        app,
+        "Download",
+        "Media transfer is complete; inspecting the downloaded container and audio tracks.",
+    );
     emit_download_progress(&app, "audio", 0, 0, "Preparing the audio file");
     let source_info = audio::inspect(&input).await?;
     let source_audio = source_info
@@ -711,6 +885,14 @@ pub async fn extract(
         .first()
         .ok_or(OnlineMediaError::NoAudio)?;
     let extension = extension_for_codec(&source_audio.codec).unwrap_or("m4a");
+    emit_technical_log(
+        app,
+        "Download",
+        format!(
+            "Audio track confirmed: {} codec; preserving the source audio without re-encoding.",
+            source_audio.codec
+        ),
+    );
     let timestamp = crate::storage::timestamp_millis() / 1000;
     let domain = domain_filename(&request.media.url);
     let base_name = if is_youtube_url(&request.media.url) {
@@ -759,6 +941,11 @@ pub async fn extract(
                 ));
             }
             tokio::fs::rename(&target, &final_path).await?;
+            emit_technical_log(
+                app,
+                "Download",
+                "Audio-only output passed media validation and was moved into the recordings library.",
+            );
             let _ = tokio::fs::remove_dir_all(&job_dir).await;
             let mut info = info;
             info.path = final_path.to_string_lossy().into_owned();
@@ -807,14 +994,35 @@ async fn yt_dlp_metadata(
     url: &str,
     cancel: Option<&AtomicBool>,
 ) -> Result<Option<Value>, OnlineMediaError> {
+    yt_dlp_metadata_with_profile(url, cancel, None).await
+}
+
+async fn yt_dlp_metadata_from_profile(
+    url: &str,
+    cancel: Option<&AtomicBool>,
+    profile_dir: &Path,
+) -> Result<Option<Value>, OnlineMediaError> {
+    yt_dlp_metadata_with_profile(url, cancel, Some(profile_dir)).await
+}
+
+async fn yt_dlp_metadata_with_profile(
+    url: &str,
+    cancel: Option<&AtomicBool>,
+    profile_dir: Option<&Path>,
+) -> Result<Option<Value>, OnlineMediaError> {
     let mut command = yt_dlp_command();
     command.args([
         "--dump-single-json",
         "--skip-download",
         "--no-playlist",
         "--no-warnings",
-        url,
     ]);
+    if let Some(profile_dir) = profile_dir {
+        command.arg("--cookies-from-browser").arg(
+            crate::browser_media::yt_dlp_cookie_profile_spec(profile_dir),
+        );
+    }
+    command.arg(url);
     command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -841,6 +1049,16 @@ async fn yt_dlp_metadata(
     };
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+        if message.contains("http error 401") || message.contains("401 unauthorized") {
+            return Err(OnlineMediaError::Unauthorized {
+                resource: "media source",
+            });
+        }
+        if message.contains("http error 403") || message.contains("403 forbidden") {
+            return Err(OnlineMediaError::Forbidden {
+                resource: "media source",
+            });
+        }
         if message.contains("sign in") || message.contains("login required") {
             return Err(OnlineMediaError::ProviderLoginRequired);
         }
@@ -961,6 +1179,27 @@ fn ytdlp_candidates(value: &Value) -> Vec<Candidate> {
         }
     }
     candidates
+}
+
+fn ytdlp_info(url: &str, value: Value) -> Option<OnlineMediaInfo> {
+    let candidates = ytdlp_candidates(&value);
+    let candidate = choose_candidate(candidates.clone())?;
+    let media_url = candidate.url.clone();
+    Some(to_info(
+        url,
+        title_from_json(&value, url),
+        value
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(|text| text.chars().take(4000).collect()),
+        source_kind(url),
+        candidate,
+        media_url,
+        candidates,
+        ytdlp_captions(&value),
+    ))
 }
 
 fn ytdlp_captions(value: &Value) -> Vec<OnlineCaption> {
@@ -1727,11 +1966,17 @@ async fn download_media_parallel(
         .map_err(|error| OnlineMediaError::Download(error.to_string()))?;
 
     if looks_like_hls(url) {
+        emit_technical_log(
+            app,
+            "Download",
+            "Fetching the HLS playlist and resolving its selected media variant.",
+        );
         emit_download_progress(app, "checking", 0, 0, "Checking how the media is stored");
         let playlist = fetch_manifest_with_client(&client, url, Some(cancel)).await?;
         let (media_playlist_url, playlist) =
             resolve_media_playlist(&client, url, playlist, cancel).await?;
         let resources = parse_hls_resources(&media_playlist_url, &playlist)?;
+        emit_technical_log(app, "Download", format!("HLS playlist contains {} media part(s); checking saved parts and preparing parallel transfers.", resources.len()));
         for resource in &resources {
             cancellable(validate_url(&resource.url), Some(cancel)).await??;
             if let Some(key_url) = &resource.key_uri {
@@ -1751,6 +1996,7 @@ async fn download_media_parallel(
                 })
                 .is_some();
         if same_object && unencrypted && (continuous_ranges || resources.len() == 1) {
+            emit_technical_log(app, "Download", "HLS resources are continuous byte ranges in one object; downloading or resuming the combined file.");
             return download_single_file(
                 app,
                 &client,
@@ -1773,6 +2019,7 @@ async fn download_media_parallel(
         )
         .await;
     }
+    emit_technical_log(app, "Download", "Source is a single media file; checking its size and resuming with HTTP Range if possible.");
     download_single_file(app, &client, url, work_dir, job_dir, cancel).await
 }
 
@@ -2365,6 +2612,7 @@ async fn download_hls_segments(
         HashMap::<String, Arc<Semaphore>>::new(),
     ));
     let total = resources.len();
+    emit_technical_log(app, "Download", format!("Starting parallel transfers for {total} HLS part(s), up to {MAX_PARALLEL_PER_HOST} per host."));
     let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     emit_download_progress(
         app,
@@ -3316,6 +3564,9 @@ fn yt_dlp_command() -> Command {
     // IDEs and debugging shells may set this to a path the app cannot write.
     // yt-dlp's Python SSL stack honors it during startup, so do not inherit it.
     command.env_remove("SSLKEYLOGFILE");
+    // Ignore user-wide yt-dlp config so cookies or browser profiles configured
+    // outside Minefia Audio are never implicitly passed to this process.
+    command.arg("--ignore-config");
     command
 }
 

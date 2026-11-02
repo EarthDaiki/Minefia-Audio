@@ -83,6 +83,14 @@ A Tauri desktop app that sends audio to the OpenAI Audio Transcriptions API, dis
 - An OpenAI API key
 - macOS 13 or later, Windows with WASAPI support, or a Linux desktop session with PipeWire running for System Audio mode
 
+## Online Media Limitations
+
+Online media login is unstable because authentication flows differ significantly between websites and may change without notice. Some sites may require additional verification or may not work with the app's private browser profile.
+
+Downloads are also particularly unreliable for network-delivered media that does not expose a usable HLS playlist. Websites load audio and video in different ways, so a source that can be inspected may still fail or produce an incomplete or unplayable file. Always check the downloaded audio before relying on it.
+
+Minefia Audio supports a broad range of online sources, but that generality comes with site-dependent behavior and limitations. It does not bypass DRM, sign-in restrictions, or other access controls.
+
 The packaged app uses bundled LGPL FFmpeg/ffprobe and the official GPLv3+ standalone yt-dlp build. Their license notices and build provenance are included under the app's `tools` resources. YouTube extraction can still be affected by provider changes; Minefia Audio reports an update hint when yt-dlp cannot parse a source and does not bypass source access controls. Developers may override bundled tool paths with `MINEFIA_FFMPEG`, `MINEFIA_FFPROBE`, or `MINEFIA_YT_DLP`.
 
 ## Development

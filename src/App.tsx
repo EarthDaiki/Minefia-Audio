@@ -52,6 +52,7 @@ type OnlineDownloadProgressEvent = {
   downloadedBytes?: number;
   totalBytes?: number;
 };
+type OnlineTechnicalLogEvent = { category: string; message: string };
 
 type TechnicalLogEntry = { taskId: string; taskName: string; timestamp: string; category: string; message: string };
 type TechnicalTask = { id: string; name: string };
@@ -1216,6 +1217,9 @@ export default function App() {
         setProgress(4);
       }
     });
+    const unlistenOnlineTechnicalLog = listen<OnlineTechnicalLogEvent>("online-technical-log", ({ payload }) => {
+      recordTechnicalLog(payload.category, payload.message, "online");
+    });
 
     const unlistenTranslation = listen<TranslationEvent>("translation-progress", ({ payload }) => {
       if (payload.kind === "done") { recordTechnicalLog("Translation", `Completed ${payload.totalChunks} part(s).`, translationLogSlotRef.current); void refreshUsage(); }
@@ -1417,6 +1421,7 @@ export default function App() {
     return () => {
       void unlistenEvent.then((fn) => fn());
       void unlistenOnlineDownload.then((fn) => fn());
+      void unlistenOnlineTechnicalLog.then((fn) => fn());
       void unlistenTranslation.then((fn) => fn());
       void unlistenSystemAudio.then((fn) => fn());
       void unlistenRealtime.then((fn) => fn());
@@ -1557,7 +1562,6 @@ export default function App() {
   const progressFinished = completed
     || phase === "Media inspected · audio stream confirmed"
     || phase === "Page inspected · choose a loaded audio or video source";
-  const backgroundWorkActive = transcriptionBusyBySlot.file || transcriptionBusyBySlot.online || onlineExtracting || onlineInspecting || webPageInspecting || localImporting || systemRecording || liveRecording || systemStopping || liveStopping || translating || summaryTranslating || questionBusy || summaryGenerating || enhancementRunning;
   const onlineDownloadLabel = (() => {
     if (!onlineExtracting || !onlineDownloadProgress) return null;
     if (onlineDownloadProgress.downloadedBytes !== undefined) {
@@ -1733,6 +1737,9 @@ export default function App() {
     setWebPageInfo(null);
     setOnlineInspecting(true);
     const kind = classifyOnlineUrl(url);
+    let sourceHost = "source host unavailable";
+    try { sourceHost = new URL(url).host; } catch { /* URL validation reports malformed input. */ }
+    recordTechnicalLog("Inspect", `Source type: ${kind}; host: ${sourceHost}.`, "online");
     setOnlineInputKind(kind === "unknown" ? "url" : kind);
     setPhase(kind === "web" ? "Opening the page and checking its loaded media" : "Inspecting media formats without downloading the source");
     try {
@@ -1745,6 +1752,7 @@ export default function App() {
         setOnlineInputKind("web");
         setProgress(100);
         setPhase("Page inspected · choose a loaded audio or video source");
+        recordTechnicalLog("Inspect", `Page inspection complete: ${info.media.length} HTML media source(s), ${info.networkMedia.length} network response(s), ${info.masterPlaylists.length} HLS playlist(s) available.`, "online");
       } else {
         try {
           const media = await invoke<OnlineMediaInfo>("inspect_online_media", { url, headlessMode: headlessBrowser });
@@ -1757,28 +1765,33 @@ export default function App() {
           setOnlineKeepVideo(false);
           setProgress(100);
           setPhase("Media inspected · audio stream confirmed");
+          recordTechnicalLog("Inspect", `Media inspection complete: ${media.availableFormats.length} format(s), selected ${media.formatLabel}.`, "online");
         } catch (mediaCause) {
           // Unknown URLs may be watch pages or signed direct media URLs; try the private browser only as a fallback.
           if (kind !== "unknown" || errorMessage(mediaCause).toLowerCase().includes("canceled")) throw mediaCause;
           setOnlineInspecting(false);
           setWebPageInspecting(true);
           setPhase("Checking the page for media that is currently loaded");
+          recordTechnicalLog("Inspect", `Direct media inspection did not resolve (${errorMessage(mediaCause)}); falling back to page and network inspection.`, "online");
           const info = await invoke<PageMediaInfo>("inspect_web_page", { url, headlessMode: headlessBrowser });
           setWebPageInfo(info);
           updateContextPrompt("online", info.pageTitle.trim() ? `Title: ${info.pageTitle.trim()}` : "");
           setOnlineInputKind("web");
           setProgress(100);
           setPhase("Page inspected · choose a loaded audio or video source");
+          recordTechnicalLog("Inspect", `Fallback page inspection complete: ${info.media.length} HTML media source(s), ${info.networkMedia.length} network response(s), ${info.masterPlaylists.length} HLS playlist(s) available.`, "online");
         }
       }
     } catch (cause) {
       const message = errorMessage(cause);
       recordTechnicalLog("Online media", `Inspection failed: ${message}`, "online");
       if (message.toLowerCase().includes("canceled")) {
+        recordTechnicalLog("Inspect", "Inspection canceled by the user.", "online");
         setError("Online media inspection was canceled.");
         setPhase("Inspection canceled");
         return;
       }
+      recordTechnicalLog("Inspect", `Inspection stopped with an error: ${message}`, "online");
       setError(message.includes("MASTER_PLAYLIST_NOT_FOUND")
         ? "A blob video was found, but no master.m3u8 playlist appeared in the observed network traffic."
         : message.includes("WEB_MEDIA_NOT_FOUND")
@@ -1898,7 +1911,7 @@ export default function App() {
     setPhase("Preparing the download");
     try {
       const extracted = await invoke<AudioInfo>("extract_online_media", {
-        request: { media: onlineMedia, keepVideo: onlineKeepVideo, headlessMode: headlessBrowser },
+        request: { media: onlineMedia, keepVideo: onlineKeepVideo },
       });
       await refreshLibraryFiles();
       setAudio(extracted);
@@ -1921,6 +1934,7 @@ export default function App() {
       setCompleted(false);
       setProgress(0);
       setPhase("Audio saved in app storage · ready to transcribe");
+      recordTechnicalLog("Download", `Audio extraction complete: saved ${extracted.name} (${formatBytes(extracted.sizeBytes)}).`, "online");
       setOnlineMedia(null);
       setSelectedOnlineCaptionId("");
     } catch (cause) {
@@ -2666,9 +2680,9 @@ export default function App() {
                 <div className={`progress-track ${onlineDownloadIndeterminate ? "indeterminate" : ""}`} style={progressStyle}><i /></div>
               </div>
             )}
-            {technicalDetails && backgroundWorkActive && <section className="technical-activity-panel" aria-live="polite">
-              <div className="technical-activity-heading"><strong>Technical details · {technicalTaskNamesBySlot[sourceMode]}</strong></div>
-              {technicalLogsBySlot[sourceMode].length === 0 ? <p>Waiting for activity in this tab…</p> : <ol>{technicalLogsBySlot[sourceMode].map((entry, index) => <li key={`${entry.timestamp}-${index}`}><time>{new Date(entry.timestamp).toLocaleTimeString()}</time><b>{entry.category}</b><span>{entry.message}</span></li>)}</ol>}
+            {technicalDetails && technicalTaskNamesBySlot[sourceMode] && <section className="technical-activity-panel" aria-live="polite">
+              <div className="technical-activity-heading"><strong>Technical details · {technicalTaskNamesBySlot[sourceMode]}</strong>{technicalLogsBySlot[sourceMode].length > 0 && <span>Now: {technicalLogsBySlot[sourceMode].at(-1)?.message}</span>}</div>
+              {technicalLogsBySlot[sourceMode].length === 0 ? <p>Waiting for activity in this tab…</p> : <ol>{technicalLogsBySlot[sourceMode].slice(-30).reverse().map((entry, index) => <li key={`${entry.timestamp}-${index}`}><time>{new Date(entry.timestamp).toLocaleTimeString()}</time><b>{entry.category}</b><span>{entry.message}</span></li>)}</ol>}
             </section>}
             {busy && <button className="cancel-processing-button" onClick={() => void cancelTranscription()} disabled={transcriptionCancelRequested}>{transcriptionCancelRequested ? <><Loader2 className="spin" size={13} /> Canceling…</> : "Cancel processing"}</button>}
 
